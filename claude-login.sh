@@ -148,15 +148,21 @@ if [[ -z "${code}" ]]; then
 fi
 printf '%s\r' "${code}" >&3
 
-echo "Waiting for the credentials to land..."
-deadline=$(( $(date +%s) + DONE_TIMEOUT ))
+echo "Waiting for the credentials to land (up to ${DONE_TIMEOUT}s)..."
+done_start="$(date +%s)"
+deadline=$(( done_start + DONE_TIMEOUT ))
 ok_creds=0
 ok_org=0
 while (( $(date +%s) < deadline )); do
+  w=$(( $(date +%s) - done_start ))
+  if (( w > 0 && w % 10 == 0 )); then
+    echo "  still waiting... (${w}s; credentials: $( (( ok_creds )) && echo refreshed || echo pending ))"
+  fi
   if (( ! ok_creds )) \
      && [[ "$(stat -c %Y "${CRED_FILE}" 2>/dev/null || echo 0)" -gt "${started_at}" ]] \
      && jq -e '.claudeAiOauth.accessToken // empty' "${CRED_FILE}" >/dev/null 2>&1; then
     ok_creds=1
+    echo "  credentials refreshed; checking organization metadata..."
   fi
   # Remote Control also needs the oauthAccount org metadata that the CLI
   # fetches right after login (see entrypoint.sh for the full gotcha).
