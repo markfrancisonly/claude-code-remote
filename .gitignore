@@ -1,3 +1,5 @@
 # runtime state & secrets — NEVER tracked (credentials live in data/)
 data/
 .env
+# host-specific operational notes kept out of the public repo
+NOTES.local.md
