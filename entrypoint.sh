@@ -36,14 +36,17 @@ STATE_FILE="${STATE_DIR}/state"
 PID_FILE="${STATE_DIR}/claude.pid"
 RUNNING_VERSION_FILE="${STATE_DIR}/running-version"
 RESTART_REQUEST_MARKER="${STATE_DIR}/restart-request"   # set by updater/recycler
-RESUME_MARKER="${STATE_DIR}/resume-next"                # relaunch with --continue
+# The reattach marker lives in the PERSISTED volume, not /run: environments
+# must come back online across container recreation and image rebuilds, not
+# just `docker restart`. Cleared only by a clean /exit.
+RESUME_MARKER="${HOME}/.claude/.resume-next"            # reattach on next launch
 FORCE_LOGIN_MARKER="${STATE_DIR}/force-login"
 FAIL_STREAK_FILE="${STATE_DIR}/fail-streak"             # consecutive fast crashes (healthcheck reads)
 mkdir -p "${STATE_DIR}"
 
 # /run is plain container fs (persists across `docker restart`): drop state
-# that must not outlive the previous supervisor. RESUME_MARKER intentionally
-# survives a restart so the session reattaches; FORCE_LOGIN stays valid too.
+# that must not outlive the previous supervisor. FORCE_LOGIN stays valid
+# across a restart.
 rm -f "${RESTART_REQUEST_MARKER}" "${PID_FILE}" "${FAIL_STREAK_FILE}"
 
 # Hub works in /docker (= host /docker); spawned project containers set
@@ -161,10 +164,25 @@ instead: run /login inside it, then /exit.
 ==============================================
 
 EOF
-  local cmd
+  local cmd tui_pid
   for cmd in "claude auth login" "claude"; do
+    # Run the interactive prompt in the background (keeping the container TTY
+    # on stdin) and poll auth_complete beside it: a login completed EXTERNALLY
+    # (docker exec -it claude claude-login) must unstick this state without a
+    # container restart — re-login never reboots the environment. The same
+    # poll also frees a `docker attach` user from needing /exit: once
+    # credentials land, the prompt is reclaimed automatically.
     # shellcheck disable=SC2086 — intentional word splitting of the command.
-    ${cmd} || true
+    ${cmd} <&0 &
+    tui_pid=$!
+    while kill -0 "${tui_pid}" 2>/dev/null; do
+      if auth_complete; then
+        zzz 3   # grace: let the prompt finish its own post-login writes
+        kill "${tui_pid}" 2>/dev/null || true
+      fi
+      zzz 5
+    done
+    wait "${tui_pid}" 2>/dev/null || true
     if auth_complete; then
       break
     fi
@@ -386,7 +404,7 @@ on_shutdown() {
   [[ -n "${RECYCLER_PID}" ]] && kill "${RECYCLER_PID}" 2>/dev/null || true
   [[ -n "${EXPIRY_PID}" ]] && kill "${EXPIRY_PID}" 2>/dev/null || true
   if [[ -n "${CLAUDE_PID}" ]] && kill -0 "${CLAUDE_PID}" 2>/dev/null; then
-    # Survives `docker restart` (/run persists): reattach the same session.
+    # Marker lives in the data volume: reattach after restart OR recreation.
     touch "${RESUME_MARKER}"
     kill -TERM "${CLAUDE_PID}" 2>/dev/null || true
     for _ in $(seq 1 30); do

@@ -60,7 +60,10 @@ rebuilds and CLI updates.
   and redraws its authorization URL, which makes it painful to copy out of
   PuTTY. `claude-login` drives that same UI in a hidden PTY, prints the URL
   alone on one line, and prompts for the pasted code — zero downtime, no
-  attach, no restart. This is the every-~30-days renewal command.
+  attach, no restart. This is the every-~30-days renewal command. It also
+  works when the supervisor is already parked at `login-required`: the
+  supervisor polls for externally-completed logins and resumes on its own —
+  re-login never requires a container restart.
 
 ## Why it stays connected (design)
 
@@ -76,9 +79,11 @@ handles all of them:
 | OAuth grant hard-expires ~30 days after `/login`; the process then dies instantly — a crash-loop that a state-freshness healthcheck alone reads as *healthy* (≤180s backoff cycles keep the state file inside the 300s staleness window) | Expiry warning N days ahead (log + optional `CLAUDE_NOTIFY_URL` push); "not logged in" stderr is classified fatal → immediate `login-required` (unhealthy); the healthcheck independently flags ≥5 consecutive fast exits as `crash-looping` |
 
 Plus: `restart: always` restarts the whole container if the supervisor
-itself ever dies; `docker stop`/`docker restart` marks the session for
-reattach; and a healthcheck distinguishes "connected", "reconnecting",
-"crash-looping" and "needs a human to log in" (`docker ps` shows it).
+itself ever dies; the reattach marker lives in the persisted volume, so
+`docker stop`, `docker restart`, and full recreation/rebuild all come back to
+the SAME claude.ai environment (only a clean `/exit` starts fresh); and a
+healthcheck distinguishes "connected", "reconnecting", "crash-looping" and
+"needs a human to log in" (`docker ps` shows it).
 
 ## Multi-project architecture
 
