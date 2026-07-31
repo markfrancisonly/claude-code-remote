@@ -13,6 +13,7 @@ full control of, and don't expose it to untrusted networks.
 ```
 <stack-dir>/               # default /docker/claude, set HOST_STACK_DIR
 ├── compose.yaml           # the hub container
+├── login.sh               # guided re-login with a copy-friendly URL
 ├── recreate.sh            # apply staged compose/.env changes via sibling handoff
 ├── Dockerfile             # image: tools + docker CLI + seed Claude install
 ├── entrypoint.sh          # supervisor: reconnect, reattach, auto-update, auth
@@ -53,6 +54,10 @@ rebuilds and CLI updates.
   days ahead, and can push both via `CLAUDE_NOTIFY_URL`. Re-login any time
   with zero downtime: `docker exec -it claude claude` → `/login` → `/exit`
   (shared credentials file — the running session adopts the new tokens).
+  Over SSH, prefer `./login.sh`: the CLI's authorization URL wraps and gets
+  redrawn by the TUI, which makes it painful to copy out of PuTTY. The script
+  routes the prompt through the supervisor so the URL appears in `docker logs`
+  and prints it alone on one line, then tells you what to attach to.
 
 ## Why it stays connected (design)
 
@@ -133,6 +138,7 @@ docker ps                                  # healthy = connected/reconnecting
 docker attach claude                       # local TTY (detach: Ctrl+P Ctrl+Q)
 docker exec -it claude bash                # shell next to the session
 docker exec claude cat /run/claude/state   # supervisor state
+./login.sh                                 # guided re-login, copy-friendly URL
 docker exec -it claude claude              # zero-downtime re-login (/login, /exit)
 CLAUDE_FORCE_AUTH_LOGIN=1 in .env + up -d  # force a fresh /login
 ```
