@@ -13,8 +13,7 @@ full control of, and don't expose it to untrusted networks.
 ```
 <stack-dir>/               # default /docker/claude, set HOST_STACK_DIR
 ├── compose.yaml           # the hub container
-├── claude-login.sh        # in-container guided OAuth login (baked into image)
-├── login.sh               # host shortcut: docker exec -it claude claude-login
+├── claude-login.sh        # guided OAuth login, baked into the image (docker exec)
 ├── recreate.sh            # apply staged compose/.env changes via sibling handoff
 ├── Dockerfile             # image: tools + docker CLI + seed Claude install
 ├── entrypoint.sh          # supervisor: reconnect, reattach, auto-update, auth
@@ -29,11 +28,11 @@ full control of, and don't expose it to untrusted networks.
 
 ```bash
 docker compose up -d --build
-./login.sh                  # guided OAuth login (prints a copy-friendly URL)
+docker exec -it claude claude-login   # guided OAuth login, copy-friendly URL
 ```
 
-(`docker attach claude` works too — detach with Ctrl+P Ctrl+Q; Ctrl+C would
-stop the session.)
+(Manual alternative: `docker exec -it claude claude`, then `/login`, complete
+the flow, `/exit`.)
 
 Auth persists in `./data/claude` and survives restarts, recreations, image
 rebuilds and CLI updates.
@@ -57,11 +56,11 @@ rebuilds and CLI updates.
   days ahead, and can push both via `CLAUDE_NOTIFY_URL`. Re-login any time
   with zero downtime: `docker exec -it claude claude` → `/login` → `/exit`
   (shared credentials file — the running session adopts the new tokens).
-  Over SSH, prefer `./login.sh` (= `docker exec -it claude claude-login`):
-  the login UI wraps and redraws its authorization URL, which makes it painful
-  to copy out of PuTTY. `claude-login` drives that UI in a hidden PTY, prints
-  the URL alone on one line, and prompts for the pasted code — zero downtime,
-  no attach, no restart.
+  Over SSH, prefer `docker exec -it claude claude-login`: the login UI wraps
+  and redraws its authorization URL, which makes it painful to copy out of
+  PuTTY. `claude-login` drives that same UI in a hidden PTY, prints the URL
+  alone on one line, and prompts for the pasted code — zero downtime, no
+  attach, no restart. This is the every-~30-days renewal command.
 
 ## Why it stays connected (design)
 
@@ -142,7 +141,7 @@ docker ps                                  # healthy = connected/reconnecting
 docker attach claude                       # local TTY (detach: Ctrl+P Ctrl+Q)
 docker exec -it claude bash                # shell next to the session
 docker exec claude cat /run/claude/state   # supervisor state
-./login.sh                                 # guided re-login, copy-friendly URL
+docker exec -it claude claude-login        # guided ~30-day re-login (see above)
 docker exec -it claude claude              # zero-downtime re-login (/login, /exit)
 CLAUDE_FORCE_AUTH_LOGIN=1 in .env + up -d  # force a fresh /login
 ```
