@@ -109,7 +109,15 @@ while (( $(date +%s) < deadline )); do
     nudges=$(( nudges + 1 ))
   fi
 
-  url="$(grep -oE 'https://(claude\.ai|console\.anthropic\.com)[^[:space:]]*' <<< "${text}" | head -1 || true)"
+  # Domains observed across CLI versions: claude.com (current), claude.ai,
+  # console.anthropic.com. Require "oauth" in the path so stray links in the
+  # UI never match. The UI hard-wraps the URL at the terminal width, so trim
+  # line ends and join all lines before matching — the URL itself contains no
+  # spaces, and the join keeps its fragments contiguous while the regex stops
+  # at the whitespace preceding whatever text follows it.
+  url="$(sed -E 's/[[:space:]]+$//' <<< "${text}" | tr -d '\n' \
+         | grep -oE 'https://(claude\.(com|ai)|console\.anthropic\.com)/[^[:space:]]*oauth[^[:space:]]*' \
+         | head -1 || true)"
   [[ -n "${url}" ]] && break
   sleep 1
 done
