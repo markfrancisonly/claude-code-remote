@@ -29,9 +29,13 @@ if [[ ! -t 0 ]]; then
   exit 1
 fi
 
+command -v script >/dev/null || { echo "util-linux 'script' is missing from the image" >&2; exit 1; }
+
 WORK="$(mktemp -d /tmp/claude-login.XXXXXX)"
 FIFO="${WORK}/in"
-OUT="${WORK}/out"
+# Stable path, kept after exit: post-mortem any failure with
+#   docker exec claude cat -v /tmp/claude-login-last.log
+OUT="/tmp/claude-login-last.log"
 mkfifo "${FIFO}"
 : > "${OUT}"
 SPID=""
@@ -58,14 +62,26 @@ strip_ansi() {
          -e $'s/\r//g' "${OUT}" 2>/dev/null || true
 }
 
-echo "Starting the login flow..."
+echo "Starting the login flow (capture: ${OUT})..."
 url=""
 picker_answered=0
 login_typed=0
 nudges=0
 deadline=$(( started_at + URL_TIMEOUT ))
 while (( $(date +%s) < deadline )); do
-  kill -0 "${SPID}" 2>/dev/null || break
+  kill -0 "${SPID}" 2>/dev/null || { echo "  login UI exited early" >&2; break; }
+  elapsed=$(( $(date +%s) - started_at ))
+
+  # The UI writes continuously once alive; a still-empty capture after 5s
+  # means the plumbing is broken — fail fast and loud, not at the timeout.
+  if (( elapsed > 5 )) && [[ ! -s "${OUT}" ]]; then
+    echo "  the login UI produced no output after ${elapsed}s — plumbing problem." >&2
+    echo "  Fallback: widen your terminal, then: docker exec -it claude claude  (/login)" >&2
+    exit 1
+  fi
+  if (( elapsed > 0 && elapsed % 10 == 0 )); then
+    echo "  waiting for the authorization URL... (${elapsed}s/${URL_TIMEOUT}s)"
+  fi
   text="$(strip_ansi)"
 
   # Fresh-login and /login both show a "select login method" picker; the
@@ -87,8 +103,8 @@ while (( $(date +%s) < deadline )); do
   # changed by a CLI update): nudge it forward with a bare Enter — twice, ten
   # seconds apart. Enter accepts the highlighted default on every known
   # screen and is harmless on the rest.
-  elapsed=$(( $(date +%s) - started_at ))
   if (( ! picker_answered && ! login_typed && nudges < 2 && elapsed > 10 * (nudges + 1) )); then
+    echo "  screen not recognized; nudging it forward (Enter)..."
     printf '\r' >&3
     nudges=$(( nudges + 1 ))
   fi
@@ -103,7 +119,8 @@ if [[ -z "${url}" ]]; then
   echo "No authorization URL appeared within ${URL_TIMEOUT}s. Last UI output:" >&2
   strip_ansi | grep -vE '^[[:space:]]*$' | tail -12 >&2
   echo >&2
-  echo "Fallback: docker attach claude   (detach: Ctrl+P then Ctrl+Q)" >&2
+  echo "Full raw capture kept at ${OUT} (view: cat -v ${OUT})." >&2
+  echo "Fallback: widen your terminal, then: docker exec -it claude claude  (/login)" >&2
   exit 1
 fi
 
