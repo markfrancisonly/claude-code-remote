@@ -20,7 +20,7 @@ set -euo pipefail
 
 CRED_FILE="${HOME}/.claude/.credentials.json"
 PERSISTED_CLAUDE_JSON="${HOME}/.claude/.claude.json"
-URL_TIMEOUT="${CLAUDE_LOGIN_URL_TIMEOUT:-60}"
+URL_TIMEOUT="${CLAUDE_LOGIN_URL_TIMEOUT:-90}"
 DONE_TIMEOUT="${CLAUDE_LOGIN_DONE_TIMEOUT:-180}"
 
 if [[ ! -t 0 ]]; then
@@ -62,6 +62,7 @@ echo "Starting the login flow..."
 url=""
 picker_answered=0
 login_typed=0
+nudges=0
 deadline=$(( started_at + URL_TIMEOUT ))
 while (( $(date +%s) < deadline )); do
   kill -0 "${SPID}" 2>/dev/null || break
@@ -80,6 +81,16 @@ while (( $(date +%s) < deadline )); do
   if (( ! login_typed && ! picker_answered )) && grep -q 'for shortcuts' <<< "${text}"; then
     printf '/login\r' >&3
     login_typed=1
+  fi
+
+  # Unrecognized screen (a wizard step, "press enter to continue", wording
+  # changed by a CLI update): nudge it forward with a bare Enter — twice, ten
+  # seconds apart. Enter accepts the highlighted default on every known
+  # screen and is harmless on the rest.
+  elapsed=$(( $(date +%s) - started_at ))
+  if (( ! picker_answered && ! login_typed && nudges < 2 && elapsed > 10 * (nudges + 1) )); then
+    printf '\r' >&3
+    nudges=$(( nudges + 1 ))
   fi
 
   url="$(grep -oE 'https://(claude\.ai|console\.anthropic\.com)[^[:space:]]*' <<< "${text}" | head -1 || true)"
