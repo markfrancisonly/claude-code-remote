@@ -41,6 +41,9 @@ services:
       CLAUDE_SESSION_NAME: ${CLAUDE_SESSION_NAME:-docker-host}
       CLAUDE_EXTRA_ARGS: ${CLAUDE_EXTRA_ARGS:---spawn=same-dir}
       INIT_COMMAND: ${CLAUDE_INIT_COMMAND:-}
+      # Seeds settings.json cleanupPeriodDays on first boot so the CLI's 30-day
+      # transcript prune doesn't eat the history that resume reads from.
+      TRANSCRIPT_RETENTION_DAYS: ${CLAUDE_TRANSCRIPT_RETENTION_DAYS:-3650}
       # Undocumented CLI escape hatch (checked as process.env.IS_SANDBOX === "1")
       # that lifts the root restriction on bypassPermissions /
       # --dangerously-skip-permissions. Not a documented API — revalidate after

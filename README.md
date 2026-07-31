@@ -114,6 +114,19 @@ cost of exposing and authenticating another network service. If ever wanted,
 it's a config-level addition (`claude mcp add` / an MCP gateway container),
 not an architecture change.
 
+## Session history & retention
+
+Transcripts live in `./data/claude/projects/<cwd-bucket>/`, on the host — a
+dead worker, a killed container or a rebuilt image never touches them. They
+are also load-bearing: reattach resolves the newest session **by reading those
+files**, so losing them turns a resumable session into an orphaned one.
+
+The CLI prunes them after `cleanupPeriodDays`, which upstream defaults to 30.
+First boot therefore seeds `settings.json` with
+`CLAUDE_TRANSCRIPT_RETENTION_DAYS` (default 3650). It only ever *adds* the key
+— set it yourself and the entrypoint leaves your value alone; set the variable
+to `0` and it won't touch `settings.json` at all.
+
 ## Auto-update
 
 Two mechanisms, both persisted so they survive recreation:

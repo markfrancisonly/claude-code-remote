@@ -339,6 +339,33 @@ expiry_warn_loop() {
   done
 }
 
+# The CLI deletes transcripts under ~/.claude/projects/ older than
+# cleanupPeriodDays (default 30). newest_session_id() resumes BY READING those
+# transcripts, so a pruned bucket silently orphans the session a relaunch would
+# have reattached — and the local copy is the only record left of a session
+# whose worker died. Seed a long retention on first boot; an existing value
+# (operator's own) is never overwritten. 0 = don't touch settings.json.
+seed_settings_defaults() {
+  local f="${HOME}/.claude/settings.json"
+  local days="${TRANSCRIPT_RETENTION_DAYS:-3650}"
+  local merged
+  [[ "${days}" == "0" ]] && return 0
+  [[ -s "${f}" ]] || printf '{}\n' > "${f}"
+  if ! jq -e . "${f}" >/dev/null 2>&1; then
+    log "WARNING: ${f} is not valid JSON; leaving it alone."
+    return 0
+  fi
+  if jq -e 'has("cleanupPeriodDays")' "${f}" >/dev/null 2>&1; then
+    return 0
+  fi
+  merged="$(mktemp)"
+  if jq --argjson d "${days}" '.cleanupPeriodDays = $d' "${f}" > "${merged}"; then
+    cat "${merged}" > "${f}"
+    log "Set cleanupPeriodDays=${days} in settings.json (transcript retention)."
+  fi
+  rm -f "${merged}"
+}
+
 # ---------------------------------------------------------------------------
 # One-time setup
 # ---------------------------------------------------------------------------
@@ -350,6 +377,7 @@ install_cli_if_missing
 mkdir -p "${WORKSPACE_DIR}/.claude"
 cd "${WORKSPACE_DIR}"
 ln -sf "${PERSISTED_CLAUDE_JSON}" "${HOME}/.claude.json"
+seed_settings_defaults
 
 if [[ -n "${DEPLOY_KEY_B64:-}" ]]; then
   log "Configuring SSH deploy key."
