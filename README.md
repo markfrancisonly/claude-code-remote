@@ -157,6 +157,10 @@ shutdowns revive on their own. Run inside the container — `plan` first, since
 `run` recreates every disconnected active session it lists and
 `cleanup --yes` deletes originals server-side.
 
+## Contributing
+
+See [HUMAN_POLICY.md](HUMAN_POLICY.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
