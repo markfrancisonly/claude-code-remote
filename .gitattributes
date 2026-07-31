@@ -1,0 +1,4 @@
+# Everything in this repo is consumed on the Linux host / inside the
+# container — force LF working copies even on Windows checkouts, so a
+# Windows-side edit can never ship CRLF into bash/compose.
+* text=auto eol=lf

@@ -1,0 +1,118 @@
+name: claude
+
+services:
+  claude:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-latest}
+    image: markfrancisonly/claude-code-remote:${DOCKER_CLAUDE_IMAGE_TAG:-local}
+    container_name: claude
+    restart: always
+    init: true
+    stdin_open: true
+    tty: true
+    stop_grace_period: 45s
+
+    # Run as root by design. This is a Docker management agent: Claude drives
+    # the host Docker daemon via the mounted socket, manages containers that
+    # run as root, and works in /docker (root-owned on the host). Root reaches
+    # the socket directly, so no group_add is needed.
+    # SECURITY: socket access == root on the host. Only expose to trusted use.
+    user: "0:0"
+
+    environment:
+      HOME: /root
+      TZ: ${TZ:-UTC}
+      DOCKER_HOST: unix:///var/run/docker.sock
+      WORKSPACE_DIR: /docker
+
+      # --- auth / git ---
+      DEPLOY_KEY_B64: ${CLAUDE_DEPLOY_KEY_B64:-}
+      GIT_REPO: ${CLAUDE_GIT_REPO:-}
+      GIT_BRANCH: ${CLAUDE_GIT_BRANCH:-}
+      GIT_USER_NAME: ${CLAUDE_GIT_USER_NAME:-}
+      GIT_USER_EMAIL: ${CLAUDE_GIT_USER_EMAIL:-}
+      CLAUDE_FORCE_AUTH_LOGIN: ${CLAUDE_FORCE_AUTH_LOGIN:-0}
+
+      # --- remote control session ---
+      CLAUDE_PERMISSION_MODE: ${CLAUDE_PERMISSION_MODE:-acceptEdits}
+      CLAUDE_SESSION_NAME: ${CLAUDE_SESSION_NAME:-docker-host}
+      CLAUDE_EXTRA_ARGS: ${CLAUDE_EXTRA_ARGS:---spawn=same-dir}
+      INIT_COMMAND: ${CLAUDE_INIT_COMMAND:-}
+      # Undocumented CLI escape hatch (checked as process.env.IS_SANDBOX === "1")
+      # that lifts the root restriction on bypassPermissions /
+      # --dangerously-skip-permissions. Not a documented API — revalidate after
+      # major CLI updates.
+      IS_SANDBOX: "1"
+      # Version installed into the persisted volume at FIRST boot (the image
+      # seed uses the same pin at build time). Auto-update moves it forward.
+      CLAUDE_INSTALL_VERSION: ${CLAUDE_CODE_VERSION:-latest}
+
+      # --- supervision / auto-update ---
+      # Hours between `claude update` checks; 0 disables the updater loop.
+      CLAUDE_UPDATE_INTERVAL_HOURS: ${CLAUDE_UPDATE_INTERVAL_HOURS:-12}
+      # 1 = restart the remote-control process right after an update lands,
+      # 0 = keep running the old version until the next natural restart.
+      CLAUDE_UPDATE_RESTART: ${CLAUDE_UPDATE_RESTART:-1}
+      # URL probed (any HTTP response counts) before (re)connecting.
+      NETWORK_PROBE_URL: ${NETWORK_PROBE_URL:-https://api.anthropic.com}
+      # Reconnect backoff bounds, seconds.
+      RECONNECT_BACKOFF_MIN: ${RECONNECT_BACKOFF_MIN:-5}
+      RECONNECT_BACKOFF_MAX: ${RECONNECT_BACKOFF_MAX:-180}
+      # 1 = after an abnormal exit, relaunch with --continue so the SAME
+      # claude.ai session is reattached instead of orphaned (CLI v2.1.200+).
+      CLAUDE_RC_CONTINUE: ${CLAUDE_RC_CONTINUE:-1}
+      # Proactively restart-and-reattach every N hours to bound silent
+      # "bridge dead but process alive" states. 0 = disabled.
+      CLAUDE_RECYCLE_HOURS: ${CLAUDE_RECYCLE_HOURS:-0}
+      # Plain-text POST target (ntfy topic / webhook) for operator alerts:
+      # login-required and OAuth-grant-expiry warnings. Empty = disabled.
+      NOTIFY_URL: ${CLAUDE_NOTIFY_URL:-}
+      # Warn when the OAuth grant (hard ~30-day lifetime from /login; token
+      # rotation does NOT extend it) is within N days of expiry. 0 = off.
+      AUTH_EXPIRY_WARN_DAYS: ${CLAUDE_AUTH_EXPIRY_WARN_DAYS:-5}
+
+      # Host-side path of this stack; used by recreate.sh when invoked from
+      # inside the container to hand the recreate off to a sibling container.
+      HOST_STACK_DIR: ${HOST_STACK_DIR:-/docker/claude}
+
+    volumes:
+      # Claude state: credentials, ~/.claude.json (via symlink), sessions.
+      - ./data/claude:/root/.claude
+      # Persisted CLI install — survives recreation, so auto-updates stick.
+      - ./data/local:/root/.local
+      # All container stacks / git repos on the host.
+      - /docker:/docker
+      # Optional: expose the host's external mounts at their true host paths.
+      # Bind the PARENT dir with rslave so automount/idle-unmount cycles on the
+      # host propagate in — binding an individual mount underneath /mnt would
+      # pin one mount instance and go stale after an idle unmount. Drop this
+      # block if the host has nothing under /mnt worth reaching.
+      - type: bind
+        source: /mnt
+        target: /mnt
+        read_only: false
+        bind:
+          propagation: rslave
+      # Full control of the host Docker daemon (always on).
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/localtime:/etc/localtime:ro
+
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    labels:
+      - traefik.enable=false
+      - com.centurylinklabs.watchtower.enable=false
