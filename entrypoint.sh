@@ -140,22 +140,23 @@ merge_onboarding_flags() {
 
 run_auth_login() {
   set_state login-required
-  notify "Login required: no usable OAuth grant. docker attach claude, run /login, detach with Ctrl+P Ctrl+Q."
+  notify "Login required: no usable OAuth grant. Run: docker exec -it claude claude-login"
   cat <<'EOF'
 
 ==============================================
   Interactive Claude auth required
 ==============================================
 
-Complete the OAuth flow below. If this container was started detached,
-attach to it with:
+Easiest path — guided login with a copy-friendly URL (from the host):
 
-  docker attach claude
+  docker exec -it claude claude-login
 
-(detach afterwards with Ctrl+P then Ctrl+Q)
+Alternative: attach to this TTY and complete the flow by hand:
 
-If no login prompt appears, an interactive claude session will open instead:
-run /login inside it, then /exit.
+  docker attach claude          (detach with Ctrl+P then Ctrl+Q)
+
+If no login prompt appears there, an interactive claude session will open
+instead: run /login inside it, then /exit.
 
 ==============================================
 

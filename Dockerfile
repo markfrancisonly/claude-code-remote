@@ -76,7 +76,9 @@ RUN mkdir -p /opt/claude-seed \
     && /opt/claude-seed/.local/bin/claude --version
 
 COPY entrypoint.sh healthcheck.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh
+COPY claude-login.sh /usr/local/bin/claude-login
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/healthcheck.sh \
+      /usr/local/bin/claude-login
 
 WORKDIR /docker
 

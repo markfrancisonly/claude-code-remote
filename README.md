@@ -13,7 +13,8 @@ full control of, and don't expose it to untrusted networks.
 ```
 <stack-dir>/               # default /docker/claude, set HOST_STACK_DIR
 ├── compose.yaml           # the hub container
-├── login.sh               # guided re-login with a copy-friendly URL
+├── claude-login.sh        # in-container guided OAuth login (baked into image)
+├── login.sh               # host shortcut: docker exec -it claude claude-login
 ├── recreate.sh            # apply staged compose/.env changes via sibling handoff
 ├── Dockerfile             # image: tools + docker CLI + seed Claude install
 ├── entrypoint.sh          # supervisor: reconnect, reattach, auto-update, auth
@@ -28,9 +29,11 @@ full control of, and don't expose it to untrusted networks.
 
 ```bash
 docker compose up -d --build
-docker attach claude        # complete the OAuth /login flow once
-# detach with Ctrl+P Ctrl+Q  (Ctrl+C would stop the session)
+./login.sh                  # guided OAuth login (prints a copy-friendly URL)
 ```
+
+(`docker attach claude` works too — detach with Ctrl+P Ctrl+Q; Ctrl+C would
+stop the session.)
 
 Auth persists in `./data/claude` and survives restarts, recreations, image
 rebuilds and CLI updates.
@@ -54,10 +57,11 @@ rebuilds and CLI updates.
   days ahead, and can push both via `CLAUDE_NOTIFY_URL`. Re-login any time
   with zero downtime: `docker exec -it claude claude` → `/login` → `/exit`
   (shared credentials file — the running session adopts the new tokens).
-  Over SSH, prefer `./login.sh`: the CLI's authorization URL wraps and gets
-  redrawn by the TUI, which makes it painful to copy out of PuTTY. The script
-  routes the prompt through the supervisor so the URL appears in `docker logs`
-  and prints it alone on one line, then tells you what to attach to.
+  Over SSH, prefer `./login.sh` (= `docker exec -it claude claude-login`):
+  the login UI wraps and redraws its authorization URL, which makes it painful
+  to copy out of PuTTY. `claude-login` drives that UI in a hidden PTY, prints
+  the URL alone on one line, and prompts for the pasted code — zero downtime,
+  no attach, no restart.
 
 ## Why it stays connected (design)
 
