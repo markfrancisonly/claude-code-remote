@@ -1,0 +1,3 @@
+# runtime state & secrets — NEVER tracked (credentials live in data/)
+data/
+.env
