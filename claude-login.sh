@@ -146,17 +146,30 @@ if [[ -z "${code}" ]]; then
   echo "Empty code; aborting." >&2
   exit 1
 fi
-printf '%s\r' "${code}" >&3
+# Send the code and the submit keystroke as SEPARATE writes: delivered in one
+# burst, the input widget consumes the trailing \r as pasted text rather than
+# as Enter, and the code sits in the field unsubmitted (observed live).
+printf '%s' "${code}" >&3
+sleep 1
+printf '\r' >&3
 
 echo "Waiting for the credentials to land (up to ${DONE_TIMEOUT}s)..."
 done_start="$(date +%s)"
 deadline=$(( done_start + DONE_TIMEOUT ))
 ok_creds=0
 ok_org=0
+resends=0
 while (( $(date +%s) < deadline )); do
   w=$(( $(date +%s) - done_start ))
   if (( w > 0 && w % 10 == 0 )); then
     echo "  still waiting... (${w}s; credentials: $( (( ok_creds )) && echo refreshed || echo pending ))"
+  fi
+  # If the submit keystroke was missed, press Enter again — harmless when the
+  # login already went through.
+  if (( ! ok_creds && resends < 2 && w >= 15 * (resends + 1) )); then
+    echo "  re-sending Enter..."
+    printf '\r' >&3
+    resends=$(( resends + 1 ))
   fi
   if (( ! ok_creds )) \
      && [[ "$(stat -c %Y "${CRED_FILE}" 2>/dev/null || echo 0)" -gt "${started_at}" ]] \
