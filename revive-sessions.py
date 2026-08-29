@@ -60,12 +60,24 @@ def sessions():
 
 def live_env(sess):
     # the env that currently-connected ACTIVE sessions (e.g. the hub primary) sit on;
-    # archived sessions can carry stale connected flags on dead envs
+    # archived sessions can carry stale connected flags on dead envs. NOTE:
+    # connection_status tracks attached *clients* and can read disconnected
+    # for every session while nobody has one open — use --env then.
     envs = {s['environment_id'] for s in sess
             if s['connection_status'] == 'connected' and s['status'] == 'active'}
     if len(envs) != 1:
-        sys.exit(f"cannot determine live env (connected sessions on: {envs or 'none'})")
+        sys.exit(f"cannot determine live env (connected sessions on: {envs or 'none'}); "
+                 f"pass --env with the id shown by the hub console or `list`")
     return envs.pop()
+
+
+def resolve_env(sess, want):
+    # accept a full env id or a unique suffix (list prints env=…XXXXXX)
+    hits = {e for e in {s['environment_id'] for s in sess}
+            if e == want or e.endswith(want)}
+    if len(hits) != 1:
+        sys.exit(f"env {want!r} matches {len(hits)} environments (need exactly 1)")
+    return hits.pop()
 
 
 def parse_ts(t):
@@ -87,8 +99,12 @@ def transcripts():
     return out
 
 
-def wedged_map(sess):
-    env = live_env(sess)
+def wedged_map(sess, src=None):
+    # src: env whose disconnected-active sessions are the revival candidates.
+    # Default is the live env (the original wedged-on-a-surviving-env case);
+    # pass --from-env when the sessions are stranded on a DEAD env — e.g.
+    # after a resume fallback registered a fresh environment (2026-08-29).
+    env = resolve_env(sess, src) if src else live_env(sess)
     trans = transcripts()
     out = []
     for s in sorted(sess, key=lambda x: x['created_at']):
@@ -127,16 +143,17 @@ def cmd_list():
               f"{s['connection_status']:<12} {s['status']}/{s['status_bucket']} | {s.get('title','')[:55]}")
 
 
-def cmd_plan():
-    for o in wedged_map(sessions()):
+def cmd_plan(src=None):
+    for o in wedged_map(sessions(), src):
         tr = os.path.basename(o['transcript']) if o['transcript'] else 'NO MATCH'
         print(f"{o['created'][:16]} {o['id'][:16]}… → {tr} (Δ{o['delta_s']}s {o['size']}B) | {o['title'][:50]}")
 
 
-def cmd_run():
-    todo = [o for o in wedged_map(sessions()) if o['transcript']]
+def cmd_run(src=None, target=None):
+    sess = sessions()
+    todo = [o for o in wedged_map(sess, src) if o['transcript']]
     state = json.load(open(STATE)) if os.path.exists(STATE) else {}
-    env = live_env(sessions())
+    env = resolve_env(sess, target) if target else live_env(sess)
     todo = [o for o in todo if state.get(o['id'], {}).get('status') not in ('done', 'failed')]
     for i in range(0, len(todo), BATCH):
         batch = todo[i:i + BATCH]
@@ -200,6 +217,14 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('cmd', choices=['list', 'plan', 'run', 'cleanup'])
     p.add_argument('--yes', action='store_true', help='cleanup: actually delete originals')
+    p.add_argument('--from-env', metavar='ENV',
+                   help='plan/run: revive sessions stranded on this env (id or '
+                        'unique suffix) instead of the live one — for sessions '
+                        'orphaned on a dead env by a fresh-environment fallback')
+    p.add_argument('--env', metavar='ENV',
+                   help='run: create replacements on this env (id or unique '
+                        'suffix) instead of auto-detecting the live one')
     a = p.parse_args()
-    {'list': cmd_list, 'plan': cmd_plan, 'run': cmd_run,
+    {'list': cmd_list, 'plan': lambda: cmd_plan(a.from_env),
+     'run': lambda: cmd_run(a.from_env, a.env),
      'cleanup': lambda: cmd_cleanup(a.yes)}[a.cmd]()

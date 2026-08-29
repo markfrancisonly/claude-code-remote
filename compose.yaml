@@ -79,6 +79,10 @@ services:
       # Supervisor log verbosity: info (default) or debug (state transitions,
       # auth-check results, expiry math — for diagnosing outages).
       LOG_LEVEL: ${CLAUDE_LOG_LEVEL:-info}
+      # Remote-control console in docker logs: log (default) = ANSI-stripped,
+      # deduped standard log lines; tui = the raw full-screen console (needed
+      # for the QR code screen over docker attach, unreadable in log viewers).
+      CLAUDE_CONSOLE: ${CLAUDE_CONSOLE:-log}
       # Fast resume failures tolerated before giving up on reattaching the
       # claude.ai environment. Giving up orphans every remote session in it.
       RESUME_RETRY_MAX: ${CLAUDE_RESUME_RETRY_MAX:-6}
