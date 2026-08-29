@@ -59,6 +59,12 @@ rebuilds and CLI updates.
   (for Home Assistant webhooks, Slack/gotify gateways, and the like). Re-login any time
   with zero downtime: `docker exec -it claude claude` → `/login` → `/exit`
   (shared credentials file — the running session adopts the new tokens).
+  Note that the claude.ai **environment id is tied to the grant**: fresh
+  registrations under an unchanged login reuse the same environment, but the
+  first launch after a re-login registers a NEW one, and the old environment's
+  sessions show "Remote environment unavailable" (their history survives
+  server-side and in local transcripts; `revive-sessions.py --from-env`
+  migrates them — see below).
   Over SSH, prefer `docker exec -it claude claude-login`: the login UI wraps
   and redraws its authorization URL, which makes it painful to copy out of
   PuTTY. `claude-login` drives that same UI in a hidden PTY, prints the URL
@@ -78,7 +84,7 @@ handles all of them:
 |---|---|
 | WebSocket drops every 20–60 min; client auto-reconnect sometimes gives up or wedges (#31853, #34255) | In-container supervisor relaunches on exit with capped backoff; optional `CLAUDE_RECYCLE_HOURS` proactively restarts-and-reattaches to bound silent wedges; auto-update keeps the many upstream reconnect fixes current |
 | Fatal OAuth 403 "poll death" every few days kills the process; a plain restart orphans all claude.ai sessions under a new environment ID (#53563) | Supervisor relaunches with `--continue` (CLI ≥ 2.1.200) which **reattaches the same claude.ai session**; auth-flavored failures are detected and only force an interactive re-login after repeated failures |
-| Right after a re-login, session lookups can fail transiently for ~a minute ("Could not reach the server to look up session…") while the fresh grant propagates; a hasty fallback registers a NEW environment and orphans every remote session in the old one (observed 2026-08-29) | 20s post-login settle before relaunching, and `CLAUDE_RESUME_RETRY_MAX` (default 6, waits 15s→60s, ~4 min runway) fast failures before giving up; abandonment is loudly logged and pushed as a `resume-abandoned` notification |
+| The CLI stopped writing `.ccr-tip.json` resume markers (~2.1.2xx, Aug 2026), so tip-based `--session-id` resume resolves to an ever-older session; its lookup fails persistently ("Could not reach the server to look up session…") and the fallback registers a fresh environment (observed twice 2026-08-29) | `--session-id` is only trusted when the tip-marked transcript is the newest in the bucket; anything staler falls through to `--continue`, the CLI's own reattach. Giving up takes `CLAUDE_RESUME_RETRY_MAX` (default 6, waits 15s→60s, ~4 min) fast failures, is loudly logged, and pushed as a `resume-abandoned` notification |
 | >~10 min of network unreachability makes the process exit **by design** (docs) | Relaunches are gated on an actual network probe, then reattach via `--continue` |
 | OAuth grant hard-expires ~30 days after `/login`; the process then dies instantly — a crash-loop that a state-freshness healthcheck alone reads as *healthy* (≤180s backoff cycles keep the state file inside the 300s staleness window) | Expiry warning N days ahead (log + optional `CLAUDE_NOTIFY_URL` push); "not logged in" stderr is classified fatal → immediate `login-required` (unhealthy); the healthcheck independently flags ≥5 consecutive fast exits as `crash-looping` |
 

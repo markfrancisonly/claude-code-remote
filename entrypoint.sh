@@ -20,14 +20,62 @@
 #   5. Surface state to the Docker healthcheck via /run/claude/state.
 set -Eeuo pipefail
 
-log() {
-  printf '[claude-entrypoint] %s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"
+# ---------------------------------------------------------------------------
+# Logging: one event per line on stdout, in a standard shape log viewers
+# (Portainer, dozzle, `docker logs`) can actually read —
+#   <RFC3339 timestamp> LEVEL [component] message
+# Level is colorized when stdout is a TTY. Components: supervisor (this
+# script), claude (the CLI's console/stderr, relayed by the filters below).
+# ---------------------------------------------------------------------------
+_C_DIM='' _C_YEL='' _C_RED='' _C_OFF=''
+if [[ -t 1 ]]; then
+  _C_DIM=$'\e[2m'; _C_YEL=$'\e[33m'; _C_RED=$'\e[31m'; _C_OFF=$'\e[0m'
+fi
+_emit() {  # _emit <color> <LEVEL> <component> <message...>
+  local c="$1" lvl="$2" comp="$3"; shift 3
+  printf '%s %s%-5s%s [%s] %s\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${c}" "${lvl}" "${_C_OFF}" "${comp}" "$*"
 }
-
+log()   { _emit ''           INFO  supervisor "$@"; }
+warn()  { _emit "${_C_YEL}"  WARN  supervisor "$@"; }
+error() { _emit "${_C_RED}"  ERROR supervisor "$@"; }
 # Verbose diagnostics, enabled with LOG_LEVEL=debug (CLAUDE_LOG_LEVEL in .env).
 debug() {
   [[ "${LOG_LEVEL:-info}" == "debug" ]] || return 0
-  log "DEBUG: $*"
+  _emit "${_C_DIM}" DEBUG supervisor "$@"
+}
+
+# Relay the CLI's stderr into the standard log shape (raw copy still lands in
+# the classification file first via tee).
+stderr_tag() {
+  local l
+  while IFS= read -r l; do
+    l="$(sed -E $'s/\x1b\\[[0-9;?]*[A-Za-z]//g' <<< "${l}")"
+    [[ -n "${l// /}" ]] || continue
+    _emit "${_C_RED}" ERROR claude "${l}"
+  done
+}
+
+# The remote-control console is a full-screen TUI: cursor-homing redraws and
+# spinner frames every ~100ms, which docker log viewers render as pages of
+# escape garbage (or nothing at all). In the default CLAUDE_CONSOLE=log mode
+# its stdout runs through this filter: ANSI stripped, blank lines dropped,
+# recently-seen lines suppressed (redraw cycles repeat the same status block),
+# the rest emitted as standard log lines. Set CLAUDE_CONSOLE=tui for the raw
+# console (e.g. to use the QR code screen over docker attach).
+console_filter() {
+  python3 -u -c '
+import collections, re, sys, time
+ansi = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][0-9A-Za-z]|\x1b[=>]|[\r\x00-\x08\x0b-\x1f]")
+recent = collections.deque(maxlen=32)
+for raw in sys.stdin:
+    l = ansi.sub("", raw).strip()
+    if not l or l in recent:
+        continue
+    recent.append(l)
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    print(f"{ts} INFO  [claude] {l}", flush=True)
+'
 }
 
 # Optional operator alert: HTTP POST to NOTIFY_URL, a generic webhook.
@@ -113,8 +161,8 @@ install_cli_if_missing() {
     hash -r
     log "Installed Claude CLI: $(claude_version)"
   else
-    log "WARNING: network install failed; falling back to image-baked CLI."
-    log "         Auto-update is degraded until a network install succeeds."
+    warn "network install failed; falling back to image-baked CLI."
+    warn "  auto-update is degraded until a network install succeeds."
   fi
 }
 
@@ -255,11 +303,8 @@ EOF
     fail_streak=0
     printf '0' > "${FAIL_STREAK_FILE}" 2>/dev/null || true
     resume_fail_streak=0
-    # A seconds-old grant can lag at the session-lookup endpoint (observed
-    # 2026-08-29: ~60s of "Could not reach the server to look up session"
-    # right after re-login, then success). Settle before the relaunch starts
-    # burning resume retries — reattaching the old environment is worth far
-    # more than 20s of extra downtime.
+    # Brief settle so the CLI's own post-login writes (org metadata, config)
+    # finish before the relaunch reads them.
     log "Login complete; settling ${POST_LOGIN_SETTLE:-20}s before relaunch."
     zzz "${POST_LOGIN_SETTLE:-20}"
   fi
@@ -295,8 +340,8 @@ ensure_auth() {
   fi
 
   if ! have_org_metadata; then
-    log "WARNING: still no organizationUuid; Remote Control will report 'Unable to"
-    log "         determine your organization'. Attach and run /login interactively."
+    warn "still no organizationUuid; Remote Control will report 'Unable to"
+    warn "  determine your organization'. Attach and run /login interactively."
   fi
 }
 
@@ -310,7 +355,7 @@ wait_for_network() {
   until curl -m 8 -s -o /dev/null "${url}"; do
     set_state network-wait
     if (( waited % 60 == 0 )); then
-      log "Network unreachable (${url}); waiting..."
+      warn "Network unreachable (${url}); waiting..."
     fi
     zzz 15
     waited=$(( waited + 15 ))
@@ -410,12 +455,12 @@ expiry_warn_loop() {
       debug "grant expiry check: ~${days_left} day(s) left (warn at <=${warn_days})."
       if (( days_left <= warn_days )) && [[ "$(cat "${stamp_file}" 2>/dev/null || true)" != "${today}" ]]; then
         if (( exp_ms / 1000 <= $(date +%s) )); then
-          log "WARNING: the OAuth grant has EXPIRED; Remote Control is down until re-login."
-          log "         Re-login: docker exec -it claude claude-login"
+          error "the OAuth grant has EXPIRED; Remote Control is down until re-login."
+          error "  re-login: docker exec -it claude claude-login"
           notify auth-expired "OAuth grant EXPIRED — Remote Control is down. Re-login: docker exec -it claude claude-login"
         else
-          log "WARNING: the OAuth grant expires in ~${days_left} day(s); Remote Control dies with it."
-          log "         Re-login without downtime: docker exec -it claude claude-login"
+          warn "the OAuth grant expires in ~${days_left} day(s); Remote Control dies with it."
+          warn "  re-login without downtime: docker exec -it claude claude-login"
           notify expiry-warning "OAuth grant expires in ~${days_left} day(s). Zero-downtime re-login: docker exec -it claude claude-login"
         fi
         printf '%s' "${today}" > "${stamp_file}"
@@ -438,7 +483,7 @@ seed_settings_defaults() {
   [[ "${days}" == "0" ]] && return 0
   [[ -s "${f}" ]] || printf '{}\n' > "${f}"
   if ! jq -e . "${f}" >/dev/null 2>&1; then
-    log "WARNING: ${f} is not valid JSON; leaving it alone."
+    warn "${f} is not valid JSON; leaving it alone."
     return 0
   fi
   if jq -e 'has("cleanupPeriodDays")' "${f}" >/dev/null 2>&1; then
@@ -489,7 +534,7 @@ fi
 if docker version >/dev/null 2>&1; then
   log "Host Docker socket is reachable."
 else
-  log "WARNING: host Docker socket is not reachable."
+  warn "host Docker socket is not reachable."
 fi
 
 init_marker="${HOME}/.claude/.init_done"
@@ -559,14 +604,18 @@ cwd_bucket() { printf '%s' "${WORKSPACE_DIR}" | sed 's/[^A-Za-z0-9]/-/g'; }
 newest_session_id() {
   local dir="${HOME}/.claude/projects/$(cwd_bucket)" f sid
   [[ -d "${dir}" ]] || return 1
-  while IFS= read -r f; do
-    sid="$(basename "${f}" .jsonl)"
-    if [[ -f "${dir}/${sid}.ccr-tip.json" ]]; then
-      printf '%s' "${sid}"
-      return 0
-    fi
-  done < <(ls -1t "${dir}"/*.jsonl 2>/dev/null)
-  return 1
+  # Only the NEWEST transcript qualifies for --session-id resume. The CLI
+  # stopped writing .ccr-tip.json markers (~2.1.2xx; last one seen
+  # 2026-08-18), so walking deeper down the mtime order just resurrects an
+  # ever-older hub session — whose server-side lookup fails ("Could not
+  # reach the server to look up session…") and drives the fallback into
+  # abandoning the environment (2026-08-29 incident, twice). A stale or
+  # missing tip now falls through to --continue, the CLI's own reattach.
+  f="$(ls -1t "${dir}"/*.jsonl 2>/dev/null | head -1)"
+  [[ -n "${f}" ]] || return 1
+  sid="$(basename "${f}" .jsonl)"
+  [[ -f "${dir}/${sid}.ccr-tip.json" ]] || return 1
+  printf '%s' "${sid}"
 }
 
 build_launch_args() {
@@ -613,12 +662,13 @@ build_launch_args() {
 BACKOFF_MIN="${RECONNECT_BACKOFF_MIN:-5}"
 BACKOFF_MAX="${RECONNECT_BACKOFF_MAX:-180}"
 # Fast resume failures tolerated before abandoning the claude.ai environment.
-# Giving up registers a FRESH environment and orphans every remote session in
-# the old one, so the budget errs long: with 15s/30s/45s/60s/60s waits, 6
-# attempts give the server ~4 minutes. That covers the observed post-re-login
-# lag where a seconds-old grant made session lookups fail transiently
-# ("Could not reach the server to look up session", 2026-08-29) — the exact
-# case where giving up is most destructive AND least warranted.
+# Giving up registers a FRESH environment, so the budget errs long: with
+# 15s/30s/45s/60s/60s waits, 6 attempts give a genuinely transient failure
+# (post-reboot network, server blip) ~4 minutes to clear. Note: under an
+# UNCHANGED login a fresh registration reuses the same environment id, so
+# falling back is mostly harmless; after a re-login the environment id
+# changes with the grant and old-env sessions are orphaned regardless
+# (revive-sessions.py --from-env migrates them).
 RESUME_RETRY_MAX="${RESUME_RETRY_MAX:-6}"
 backoff="${BACKOFF_MIN}"
 auth_suspect_streak=0
@@ -642,9 +692,9 @@ while true; do
   fi
   rm -f "${RESUME_MARKER}"
   if (( resume == 1 && resume_fail_streak >= RESUME_RETRY_MAX )); then
-    log "Resume failed ${resume_fail_streak} times in a row; abandoning the old environment."
-    log "A FRESH environment will register — existing claude.ai sessions will show"
-    log "'Remote environment unavailable' (revive-sessions.py can recreate them)."
+    error "Resume failed ${resume_fail_streak} times in a row; abandoning the old environment."
+    error "  a FRESH environment will register — existing claude.ai sessions will show"
+    error "  'Remote environment unavailable' (revive-sessions.py can recreate them)."
     notify resume-abandoned "Could not reattach the previous claude.ai environment after ${resume_fail_streak} attempts; registered a fresh one. Old remote sessions are orphaned — revive-sessions.py can recreate them."
     resume=0
     resume_fail_streak=0
@@ -663,8 +713,15 @@ while true; do
 
   set +e
   # <&0 keeps the container TTY on stdin (bash redirects background jobs'
-  # stdin from /dev/null otherwise, which breaks the interactive TUI).
-  "${LAUNCH_ARGS[@]}" <&0 2> >(tee "${err_file}" >&2) &
+  # stdin from /dev/null otherwise, which breaks interactive keys). stderr is
+  # tee'd raw into err_file for exit classification and relayed to the log as
+  # ERROR [claude] lines; stdout is filtered into standard log lines by
+  # default, or left as the raw TUI with CLAUDE_CONSOLE=tui.
+  if [[ "${CLAUDE_CONSOLE:-log}" == "tui" ]]; then
+    "${LAUNCH_ARGS[@]}" <&0 2> >(tee "${err_file}" | stderr_tag) &
+  else
+    "${LAUNCH_ARGS[@]}" <&0 > >(console_filter) 2> >(tee "${err_file}" | stderr_tag) &
+  fi
   CLAUDE_PID=$!
   echo "${CLAUDE_PID}" > "${PID_FILE}"
   set_state running
@@ -693,7 +750,11 @@ while true; do
     continue
   fi
 
-  log "Claude exited (status ${status}) after ${duration}s."
+  if [[ "${status}" != "0" ]]; then
+    warn "Claude exited (status ${status}) after ${duration}s."
+  else
+    log "Claude exited cleanly after ${duration}s."
+  fi
 
   # Consecutive-fast-crash counter for the healthcheck: a loop of instant
   # exits used to look "healthy" forever, because every backoff cycle
@@ -715,7 +776,7 @@ while true; do
     resume_fail_streak=$(( resume_fail_streak + 1 ))
     resume_wait=$(( 15 * resume_fail_streak ))
     (( resume_wait > 60 )) && resume_wait=60
-    log "Resume attempt failed fast (${resume_fail_streak}/${RESUME_RETRY_MAX}); retrying in ${resume_wait}s."
+    warn "Resume attempt failed fast (${resume_fail_streak}/${RESUME_RETRY_MAX}); retrying in ${resume_wait}s."
     cat "${err_file}" > "${LAST_STDERR_FILE}" 2>/dev/null || true
     rm -f "${err_file}"
     zzz "${resume_wait}"
@@ -728,8 +789,8 @@ while true; do
     cat "${err_file}" > "${LAST_STDERR_FILE}" 2>/dev/null || true
   fi
   if grep -Eq "${AUTH_FATAL_RE}" "${err_file}"; then
-    log "Fatal auth error (expired/revoked grant or wrong account type); forcing re-login."
-    log "  matched: $(grep -Eo -m1 "${AUTH_FATAL_RE}" "${err_file}" || true)"
+    error "Fatal auth error (expired/revoked grant or wrong account type); forcing re-login."
+    error "  matched: $(grep -Eo -m1 "${AUTH_FATAL_RE}" "${err_file}" || true)"
     touch "${FORCE_LOGIN_MARKER}"
     auth_suspect_streak=0
   elif grep -Eq "Access denied \(403\)|status code 401|no longer a member of the organization|Failed to refresh session token|OAuth token has expired" "${err_file}"; then
@@ -737,9 +798,9 @@ while true; do
     # often recover on relaunch after refresh; only force an interactive
     # re-login after repeated fast auth-flavored failures.
     auth_suspect_streak=$(( auth_suspect_streak + 1 ))
-    log "Auth-flavored exit detected (streak ${auth_suspect_streak})."
+    warn "Auth-flavored exit detected (streak ${auth_suspect_streak})."
     if (( auth_suspect_streak >= 3 && duration < 300 )); then
-      log "Repeated auth failures; forcing interactive re-login."
+      error "Repeated auth failures; forcing interactive re-login."
       touch "${FORCE_LOGIN_MARKER}"
       auth_suspect_streak=0
     fi
