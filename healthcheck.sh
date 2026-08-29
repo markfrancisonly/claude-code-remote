@@ -7,8 +7,9 @@
 #   healthy   - claude process is alive, or the supervisor is in a short-lived
 #               transitional state (starting/backoff/network-wait/updating)
 #               that has been refreshed recently.
-#   unhealthy - login required (needs a human to `docker attach claude`), a
-#               transitional state has gone stale, or state is missing.
+#   unhealthy - login required (needs a human: docker exec -it claude
+#               claude-login), a transitional state has gone stale, or state
+#               is missing.
 set -uo pipefail
 
 STATE_DIR=/run/claude
@@ -51,7 +52,7 @@ case "${state}" in
     exit 1
     ;;
   login-required)
-    echo "login required: docker attach claude"
+    echo "login required: docker exec -it claude claude-login"
     exit 1
     ;;
   *)

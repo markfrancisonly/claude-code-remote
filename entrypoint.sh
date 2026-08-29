@@ -24,11 +24,29 @@ log() {
   printf '[claude-entrypoint] %s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$*"
 }
 
-# Optional operator alert: plain-text POST to NOTIFY_URL (ntfy topic / generic
-# webhook). Best-effort — an unreachable notifier must never worsen an outage.
-notify() {
+# Verbose diagnostics, enabled with LOG_LEVEL=debug (CLAUDE_LOG_LEVEL in .env).
+debug() {
+  [[ "${LOG_LEVEL:-info}" == "debug" ]] || return 0
+  log "DEBUG: $*"
+}
+
+# Optional operator alert: HTTP POST to NOTIFY_URL, a generic webhook.
+# NOTIFY_FORMAT=text (default) sends the message as a plain-text body
+# (ntfy-style); NOTIFY_FORMAT=json sends {"source","event","message"} for
+# consumers that want structure (Home Assistant webhooks, Slack proxies,
+# gotify gateways, ...). Best-effort — an unreachable notifier must never
+# worsen an outage.
+notify() {  # notify <event-slug> <message...>
   [[ -n "${NOTIFY_URL:-}" ]] || return 0
-  curl -m 10 -s -o /dev/null -d "[claude-hub] $*" "${NOTIFY_URL}" || true
+  local event="$1"; shift
+  if [[ "${NOTIFY_FORMAT:-text}" == "json" ]]; then
+    jq -cn --arg event "${event}" --arg message "$*" \
+       '{source: "claude-hub", event: $event, message: $message}' \
+      | curl -m 10 -s -o /dev/null -H 'Content-Type: application/json' \
+             -d @- "${NOTIFY_URL}" || true
+  else
+    curl -m 10 -s -o /dev/null -d "[claude-hub] $*" "${NOTIFY_URL}" || true
+  fi
 }
 
 STATE_DIR=/run/claude
@@ -42,7 +60,15 @@ RESTART_REQUEST_MARKER="${STATE_DIR}/restart-request"   # set by updater/recycle
 RESUME_MARKER="${HOME}/.claude/.resume-next"            # reattach on next launch
 FORCE_LOGIN_MARKER="${STATE_DIR}/force-login"
 FAIL_STREAK_FILE="${STATE_DIR}/fail-streak"             # consecutive fast crashes (healthcheck reads)
+NOTIFY_LOGIN_STAMP="${STATE_DIR}/notify-login-stamp"    # hourly login-required alert throttle
+STATE_HISTORY_FILE="${STATE_DIR}/state-history"         # timestamped state transitions
+LAST_STDERR_FILE="${STATE_DIR}/last-stderr"             # stderr of the last abnormal exit
 mkdir -p "${STATE_DIR}"
+# Keep the transition trail bounded (it survives docker restart).
+if [[ -f "${STATE_HISTORY_FILE}" ]]; then
+  tail -n 500 "${STATE_HISTORY_FILE}" > "${STATE_HISTORY_FILE}.tmp" 2>/dev/null \
+    && mv "${STATE_HISTORY_FILE}.tmp" "${STATE_HISTORY_FILE}" || true
+fi
 
 # /run is plain container fs (persists across `docker restart`): drop state
 # that must not outlive the previous supervisor. FORCE_LOGIN stays valid
@@ -63,6 +89,11 @@ zzz() {
 
 set_state() {
   printf '%s' "$1" > "${STATE_FILE}"
+  # Timestamped transition trail for post-mortems (`docker exec claude cat
+  # /run/claude/state-history`): reconstructing an outage from interleaved
+  # console logs alone proved painful (2026-08-29 expired-grant incident).
+  printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> "${STATE_HISTORY_FILE}" 2>/dev/null || true
+  debug "state -> $1"
 }
 
 claude_version() {
@@ -118,8 +149,18 @@ have_credentials() {
   [[ -f "${CRED_FILE}" && -s "${CRED_FILE}" ]]
 }
 
+# The CLI blanks the tokens (but keeps the file, with refreshTokenExpiresAt
+# and scopes intact) when the grant hard-expires. A mere file-exists check
+# therefore reads a DEAD grant as logged-in — which once made run_auth_login
+# kill its own login prompt after one poll and report success, leaving the
+# supervisor bouncing through healthy-looking backoff cycles for the whole
+# outage. "Complete" requires an actual access token.
+have_access_token() {
+  jq -e '.claudeAiOauth.accessToken // empty' "${CRED_FILE}" >/dev/null 2>&1
+}
+
 auth_complete() {
-  have_credentials && have_org_metadata
+  have_credentials && have_access_token && have_org_metadata
 }
 
 merge_onboarding_flags() {
@@ -142,8 +183,27 @@ merge_onboarding_flags() {
 }
 
 run_auth_login() {
+  # Credentials written strictly before ${since} don't count as a completed
+  # login: without this gate a stale-but-parseable credentials file (or, on a
+  # forced refresh, the very grant being replaced) satisfies the poll on its
+  # first pass and the login prompt gets killed before a human ever sees it.
+  local since="${1:-$(date +%s)}"
+  fresh_login() {
+    auth_complete \
+      && [[ "$(stat -c %Y "${CRED_FILE}" 2>/dev/null || echo 0)" -ge "${since}" ]]
+  }
   set_state login-required
-  notify "Login required: no usable OAuth grant. Run: docker exec -it claude claude-login"
+
+  # Alert at most hourly: during an outage the supervisor may re-enter this
+  # state every cycle, and each re-entry is the same news.
+  local now_ts last_ts
+  now_ts="$(date +%s)"
+  last_ts="$(cat "${NOTIFY_LOGIN_STAMP}" 2>/dev/null || echo 0)"
+  [[ "${last_ts}" =~ ^[0-9]+$ ]] || last_ts=0
+  if (( now_ts - last_ts >= 3600 )); then
+    notify login-required "Login required: no usable OAuth grant. Run: docker exec -it claude claude-login"
+    printf '%s' "${now_ts}" > "${NOTIFY_LOGIN_STAMP}" 2>/dev/null || true
+  fi
   cat <<'EOF'
 
 ==============================================
@@ -176,33 +236,52 @@ EOF
     ${cmd} <&0 &
     tui_pid=$!
     while kill -0 "${tui_pid}" 2>/dev/null; do
-      if auth_complete; then
+      if fresh_login; then
         zzz 3   # grace: let the prompt finish its own post-login writes
         kill "${tui_pid}" 2>/dev/null || true
       fi
       zzz 5
     done
     wait "${tui_pid}" 2>/dev/null || true
-    if auth_complete; then
+    if fresh_login; then
       break
     fi
   done
   merge_onboarding_flags
-  fail_streak=0
-  printf '0' > "${FAIL_STREAK_FILE}" 2>/dev/null || true
+  # Only a completed login clears the crash counter. Resetting it
+  # unconditionally here once neutered the healthcheck's crash-loop detector
+  # for the entire duration of an expired-grant outage.
+  if fresh_login; then
+    fail_streak=0
+    printf '0' > "${FAIL_STREAK_FILE}" 2>/dev/null || true
+    resume_fail_streak=0
+    # A seconds-old grant can lag at the session-lookup endpoint (observed
+    # 2026-08-29: ~60s of "Could not reach the server to look up session"
+    # right after re-login, then success). Settle before the relaunch starts
+    # burning resume retries — reattaching the old environment is worth far
+    # more than 20s of extra downtime.
+    log "Login complete; settling ${POST_LOGIN_SETTLE:-20}s before relaunch."
+    zzz "${POST_LOGIN_SETTLE:-20}"
+  fi
 }
 
 ensure_auth() {
   set_state auth-check
   if [[ -f "${FORCE_LOGIN_MARKER}" ]]; then
+    # Any credentials written after the failure was classified count as the
+    # awaited login — covers a re-login completed externally (claude-login)
+    # during the backoff that preceded this cycle.
+    local forced_at
+    forced_at="$(stat -c %Y "${FORCE_LOGIN_MARKER}" 2>/dev/null || echo 0)"
     rm -f "${FORCE_LOGIN_MARKER}"
     log "Auth refresh required (requested by session failure analysis)."
-    run_auth_login
+    run_auth_login "${forced_at}"
   elif [[ "${CLAUDE_FORCE_AUTH_LOGIN:-0}" == "1" ]]; then
     log "CLAUDE_FORCE_AUTH_LOGIN=1; refreshing Claude auth."
     CLAUDE_FORCE_AUTH_LOGIN=0
     run_auth_login
   elif auth_complete; then
+    debug "auth check passed (credentials + access token + org metadata)."
     merge_onboarding_flags
     return 0
   else
@@ -328,10 +407,17 @@ expiry_warn_loop() {
       days_left=$(( (exp_ms / 1000 - $(date +%s)) / 86400 ))
       (( days_left < 0 )) && days_left=0
       today="$(date +%F)"
+      debug "grant expiry check: ~${days_left} day(s) left (warn at <=${warn_days})."
       if (( days_left <= warn_days )) && [[ "$(cat "${stamp_file}" 2>/dev/null || true)" != "${today}" ]]; then
-        log "WARNING: the OAuth grant expires in ~${days_left} day(s); Remote Control dies with it."
-        log "         Re-login without downtime: docker exec -it claude claude -> /login -> /exit"
-        notify "OAuth grant expires in ~${days_left} day(s). Re-login: docker exec -it claude claude, then /login."
+        if (( exp_ms / 1000 <= $(date +%s) )); then
+          log "WARNING: the OAuth grant has EXPIRED; Remote Control is down until re-login."
+          log "         Re-login: docker exec -it claude claude-login"
+          notify auth-expired "OAuth grant EXPIRED — Remote Control is down. Re-login: docker exec -it claude claude-login"
+        else
+          log "WARNING: the OAuth grant expires in ~${days_left} day(s); Remote Control dies with it."
+          log "         Re-login without downtime: docker exec -it claude claude-login"
+          notify expiry-warning "OAuth grant expires in ~${days_left} day(s). Zero-downtime re-login: docker exec -it claude claude-login"
+        fi
         printf '%s' "${today}" > "${stamp_file}"
       fi
     fi
@@ -526,6 +612,14 @@ build_launch_args() {
 
 BACKOFF_MIN="${RECONNECT_BACKOFF_MIN:-5}"
 BACKOFF_MAX="${RECONNECT_BACKOFF_MAX:-180}"
+# Fast resume failures tolerated before abandoning the claude.ai environment.
+# Giving up registers a FRESH environment and orphans every remote session in
+# the old one, so the budget errs long: with 15s/30s/45s/60s/60s waits, 6
+# attempts give the server ~4 minutes. That covers the observed post-re-login
+# lag where a seconds-old grant made session lookups fail transiently
+# ("Could not reach the server to look up session", 2026-08-29) — the exact
+# case where giving up is most destructive AND least warranted.
+RESUME_RETRY_MAX="${RESUME_RETRY_MAX:-6}"
 backoff="${BACKOFF_MIN}"
 auth_suspect_streak=0
 resume_fail_streak=0
@@ -547,8 +641,11 @@ while true; do
     resume=1
   fi
   rm -f "${RESUME_MARKER}"
-  if (( resume == 1 && resume_fail_streak >= 3 )); then
-    log "Resume failed ${resume_fail_streak} times in a row; starting a fresh session."
+  if (( resume == 1 && resume_fail_streak >= RESUME_RETRY_MAX )); then
+    log "Resume failed ${resume_fail_streak} times in a row; abandoning the old environment."
+    log "A FRESH environment will register — existing claude.ai sessions will show"
+    log "'Remote environment unavailable' (revive-sessions.py can recreate them)."
+    notify resume-abandoned "Could not reattach the previous claude.ai environment after ${resume_fail_streak} attempts; registered a fresh one. Old remote sessions are orphaned — revive-sessions.py can recreate them."
     resume=0
     resume_fail_streak=0
   fi
@@ -616,16 +713,23 @@ while true; do
   if [[ "${resume}" == "1" && "${status}" != "0" && "${duration}" -lt 30 ]] \
      && ! grep -Eq "${AUTH_FATAL_RE}" "${err_file}"; then
     resume_fail_streak=$(( resume_fail_streak + 1 ))
-    log "Resume attempt failed fast (${resume_fail_streak}/3); retrying."
+    resume_wait=$(( 15 * resume_fail_streak ))
+    (( resume_wait > 60 )) && resume_wait=60
+    log "Resume attempt failed fast (${resume_fail_streak}/${RESUME_RETRY_MAX}); retrying in ${resume_wait}s."
+    cat "${err_file}" > "${LAST_STDERR_FILE}" 2>/dev/null || true
     rm -f "${err_file}"
-    zzz $(( 10 * resume_fail_streak ))
+    zzz "${resume_wait}"
     continue
   fi
   resume_fail_streak=0
 
-  # Classify the failure from stderr.
+  # Classify the failure from stderr; keep a copy for post-mortems.
+  if [[ "${status}" != "0" ]]; then
+    cat "${err_file}" > "${LAST_STDERR_FILE}" 2>/dev/null || true
+  fi
   if grep -Eq "${AUTH_FATAL_RE}" "${err_file}"; then
     log "Fatal auth error (expired/revoked grant or wrong account type); forcing re-login."
+    log "  matched: $(grep -Eo -m1 "${AUTH_FATAL_RE}" "${err_file}" || true)"
     touch "${FORCE_LOGIN_MARKER}"
     auth_suspect_streak=0
   elif grep -Eq "Access denied \(403\)|status code 401|no longer a member of the organization|Failed to refresh session token|OAuth token has expired" "${err_file}"; then
