@@ -92,10 +92,18 @@ while (( $(date +%s) < deadline )); do
     picker_answered=1
   fi
 
-  # Already-valid credentials: claude opens its normal idle UI instead of the
-  # login wizard. Ask for a re-login explicitly (proactive monthly refresh).
-  if (( ! login_typed && ! picker_answered )) && grep -q 'for shortcuts' <<< "${text}"; then
-    printf '/login\r' >&3
+  # Idle UI instead of the login wizard: happens with already-valid
+  # credentials (proactive monthly refresh) AND on expired ones (CLI
+  # ~2.1.251+ opens the normal prompt with a "Not logged in · Run /login"
+  # status instead of the wizard). Recognize either status-line wording —
+  # "? for shortcuts" (older CLIs), "Not logged in" / "shift+tab to cycle"
+  # (current) — and ask for a re-login explicitly. Type and submit as
+  # separate writes: a single burst gets the \r consumed as pasted text
+  # (same hazard as the code paste below).
+  if (( ! login_typed && ! picker_answered )) && grep -qE 'for shortcuts|Not logged in|shift\+tab' <<< "${text}"; then
+    printf '/login' >&3
+    sleep 1
+    printf '\r' >&3
     login_typed=1
   fi
 
