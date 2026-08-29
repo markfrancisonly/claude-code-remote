@@ -34,8 +34,12 @@ fi
 _emit() {  # _emit <color> <LEVEL> <component> <message...>
   local c="$1" lvl="$2" comp="$3"; shift 3
   printf '%s %s%-5s%s [%s] %s\n' \
-    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${c}" "${lvl}" "${_C_OFF}" "${comp}" "$*"
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${c}" "${lvl}" "${c:+${_C_OFF}}" "${comp}" "$*"
 }
+# Stable handle to PID1 stdout: the launch pipeline's process substitutions
+# write through fd 9 explicitly, so the stderr relay can never end up feeding
+# the console filter (observed as double-tagged lines).
+exec 9>&1
 log()   { _emit ''           INFO  supervisor "$@"; }
 warn()  { _emit "${_C_YEL}"  WARN  supervisor "$@"; }
 error() { _emit "${_C_RED}"  ERROR supervisor "$@"; }
@@ -46,13 +50,19 @@ debug() {
 }
 
 # Relay the CLI's stderr into the standard log shape (raw copy still lands in
-# the classification file first via tee).
+# the classification file first via tee). Not everything on stderr is an
+# error — the CLI logs progress there too ("Resuming session …") — so only
+# Error-looking lines get the ERROR level.
 stderr_tag() {
   local l
   while IFS= read -r l; do
     l="$(sed -E $'s/\x1b\\[[0-9;?]*[A-Za-z]//g' <<< "${l}")"
     [[ -n "${l// /}" ]] || continue
-    _emit "${_C_RED}" ERROR claude "${l}"
+    if [[ "${l}" == Error* || "${l}" == *" Error:"* ]]; then
+      _emit "${_C_RED}" ERROR claude "${l}"
+    else
+      _emit '' INFO claude "${l}"
+    fi
   done
 }
 
@@ -106,6 +116,7 @@ RESTART_REQUEST_MARKER="${STATE_DIR}/restart-request"   # set by updater/recycle
 # must come back online across container recreation and image rebuilds, not
 # just `docker restart`. Cleared only by a clean /exit.
 RESUME_MARKER="${HOME}/.claude/.resume-next"            # reattach on next launch
+HUB_SID_FILE="${HOME}/.claude/.hub-primary-sid"         # the hub console session's id (see record_hub_primary)
 FORCE_LOGIN_MARKER="${STATE_DIR}/force-login"
 FAIL_STREAK_FILE="${STATE_DIR}/fail-streak"             # consecutive fast crashes (healthcheck reads)
 NOTIFY_LOGIN_STAMP="${STATE_DIR}/notify-login-stamp"    # hourly login-required alert throttle
@@ -601,21 +612,39 @@ cwd_bucket() { printf '%s' "${WORKSPACE_DIR}" | sed 's/[^A-Za-z0-9]/-/g'; }
 # Only sessions with a sibling <id>.ccr-tip.json marker qualify — that marker is
 # what remote-control leaves next to its own transcripts, and the filter keeps
 # us from resuming headless/cron/local-CLI runs that share the same cwd bucket.
-newest_session_id() {
-  local dir="${HOME}/.claude/projects/$(cwd_bucket)" f sid
-  [[ -d "${dir}" ]] || return 1
-  # Only the NEWEST transcript qualifies for --session-id resume. The CLI
-  # stopped writing .ccr-tip.json markers (~2.1.2xx; last one seen
-  # 2026-08-18), so walking deeper down the mtime order just resurrects an
-  # ever-older hub session — whose server-side lookup fails ("Could not
-  # reach the server to look up session…") and drives the fallback into
-  # abandoning the environment (2026-08-29 incident, twice). A stale or
-  # missing tip now falls through to --continue, the CLI's own reattach.
-  f="$(ls -1t "${dir}"/*.jsonl 2>/dev/null | head -1)"
-  [[ -n "${f}" ]] || return 1
-  sid="$(basename "${f}" .jsonl)"
-  [[ -f "${dir}/${sid}.ccr-tip.json" ]] || return 1
+# The hub's own console session (the "primary") is the ONLY session a
+# relaunch can resume to restore the full multi-session server. Resuming a
+# WORKER session — which is what `--continue` picks, since workers have the
+# freshest transcripts — yields a single-session bridge ("Single session ·
+# exits when complete") that serves nothing else on the environment
+# (observed 2026-08-29). And the CLI no longer marks its own sessions
+# (.ccr-tip.json markers stopped ~2.1.2xx, last seen 2026-08-18; before
+# that, stale markers resurrected long-dead sessions whose lookups fail and
+# trigger environment abandonment). So the supervisor records the primary
+# itself: at every fresh registration, the first NEW transcript to appear in
+# the bucket belongs to the primary. No recorded primary -> register fresh;
+# never --continue.
+hub_primary_sid() {
+  local dir="${HOME}/.claude/projects/$(cwd_bucket)" sid
+  sid="$(cat "${HUB_SID_FILE}" 2>/dev/null || true)"
+  [[ -n "${sid}" && -f "${dir}/${sid}.jsonl" ]] || return 1
   printf '%s' "${sid}"
+}
+
+record_hub_primary() {  # $1 = file listing the transcripts that predate launch
+  local dir="${HOME}/.claude/projects/$(cwd_bucket)" i f sid
+  for i in $(seq 1 45); do
+    while IFS= read -r f; do
+      grep -qxF "${f}" "$1" 2>/dev/null && continue
+      sid="$(basename "${f}" .jsonl)"
+      printf '%s' "${sid}" > "${HUB_SID_FILE}"
+      log "Recorded hub primary session ${sid}."
+      return 0
+    done < <(ls -1tr "${dir}"/*.jsonl 2>/dev/null)   # oldest-first: the primary is created before any worker
+    zzz 2
+  done
+  warn "no new transcript appeared after fresh registration; hub primary not recorded."
+  rm -f "${HUB_SID_FILE}"
 }
 
 build_launch_args() {
@@ -624,16 +653,12 @@ build_launch_args() {
   LAUNCH_ARGS+=(--permission-mode "${CLAUDE_PERMISSION_MODE:-acceptEdits}")
   [[ -n "${CLAUDE_SESSION_NAME:-}" ]] && LAUNCH_ARGS+=(--name "${CLAUDE_SESSION_NAME}")
   if [[ "${resume}" == "1" ]]; then
-    # Prefer resuming an exact session id (no recency window); fall back to
-    # --continue if we can't find one. Both strip the spawn flags below.
+    # The caller guarantees a recorded primary exists (see the main loop);
+    # resume exactly it. The spawn flags are stripped below for resumes.
     local sid
-    sid="$(newest_session_id || true)"
-    if [[ -n "${sid}" ]]; then
-      LAUNCH_ARGS+=(--session-id "${sid}")
-      log "Resuming session ${sid} via --session-id."
-    else
-      LAUNCH_ARGS+=(--continue)
-    fi
+    sid="$(hub_primary_sid)"
+    LAUNCH_ARGS+=(--session-id "${sid}")
+    log "Resuming hub primary session ${sid} via --session-id."
   fi
   if [[ -n "${CLAUDE_EXTRA_ARGS:-}" ]]; then
     local extra=() tok skip_next=0
@@ -691,6 +716,11 @@ while true; do
     resume=1
   fi
   rm -f "${RESUME_MARKER}"
+  if (( resume == 1 )) && ! hub_primary_sid >/dev/null; then
+    warn "Reattach requested but no recorded hub primary session; registering fresh."
+    warn "  (a fresh registration under an unchanged login reuses the same environment)"
+    resume=0
+  fi
   if (( resume == 1 && resume_fail_streak >= RESUME_RETRY_MAX )); then
     error "Resume failed ${resume_fail_streak} times in a row; abandoning the old environment."
     error "  a FRESH environment will register — existing claude.ai sessions will show"
@@ -711,20 +741,29 @@ while true; do
   # Removed after a clean /exit below.
   [[ "${CLAUDE_RC_CONTINUE:-1}" == "1" ]] && touch "${RESUME_MARKER}"
 
+  # Snapshot the transcript bucket so a fresh registration can identify the
+  # NEW file its primary session creates (see record_hub_primary).
+  ls -1 "${HOME}/.claude/projects/$(cwd_bucket)"/*.jsonl > "${STATE_DIR}/pre-launch-jsonl" 2>/dev/null \
+    || : > "${STATE_DIR}/pre-launch-jsonl"
+
   set +e
   # <&0 keeps the container TTY on stdin (bash redirects background jobs'
   # stdin from /dev/null otherwise, which breaks interactive keys). stderr is
-  # tee'd raw into err_file for exit classification and relayed to the log as
-  # ERROR [claude] lines; stdout is filtered into standard log lines by
-  # default, or left as the raw TUI with CLAUDE_CONSOLE=tui.
+  # tee'd raw into err_file for exit classification and relayed into the log
+  # via stderr_tag; stdout is filtered into standard log lines by default, or
+  # left as the raw TUI with CLAUDE_CONSOLE=tui. The filters write to fd 9
+  # (PID1 stdout) explicitly so the two streams can't chain into each other.
   if [[ "${CLAUDE_CONSOLE:-log}" == "tui" ]]; then
-    "${LAUNCH_ARGS[@]}" <&0 2> >(tee "${err_file}" | stderr_tag) &
+    "${LAUNCH_ARGS[@]}" <&0 2> >(tee "${err_file}" | stderr_tag >&9) &
   else
-    "${LAUNCH_ARGS[@]}" <&0 > >(console_filter) 2> >(tee "${err_file}" | stderr_tag) &
+    "${LAUNCH_ARGS[@]}" <&0 > >(console_filter >&9) 2> >(tee "${err_file}" | stderr_tag >&9) &
   fi
   CLAUDE_PID=$!
   echo "${CLAUDE_PID}" > "${PID_FILE}"
   set_state running
+  if (( resume == 0 )); then
+    record_hub_primary "${STATE_DIR}/pre-launch-jsonl" &
+  fi
   wait "${CLAUDE_PID}"
   status=$?
   set -e
