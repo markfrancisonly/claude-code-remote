@@ -50,7 +50,7 @@ started_at="$(date +%s)"
 # Read-write open so neither end of the FIFO blocks; keystrokes reach the UI
 # through fd 3. The PTY is made very wide so the URL never wraps mid-line.
 exec 3<>"${FIFO}"
-script -qfc "stty cols 500 rows 50 2>/dev/null; exec claude" "${OUT}" <&3 >/dev/null 2>&1 &
+script -qfc "stty cols 2000 rows 50 2>/dev/null; exec claude" "${OUT}" <&3 >/dev/null 2>&1 &
 SPID=$!
 
 # Strip ANSI escapes (CSI, then BEL-terminated OSC, then any stray ESC) and
@@ -117,14 +117,10 @@ while (( $(date +%s) < deadline )); do
     nudges=$(( nudges + 1 ))
   fi
 
-  # Domains observed across CLI versions: claude.com (current), claude.ai,
-  # console.anthropic.com. Require "oauth" in the path so stray links in the
-  # UI never match. The UI hard-wraps the URL at the terminal width, so trim
-  # line ends and join all lines before matching — the URL itself contains no
-  # spaces, and the join keeps its fragments contiguous while the regex stops
-  # at the whitespace preceding whatever text follows it.
-  url="$(sed -E 's/[[:space:]]+$//' <<< "${text}" | tr -d '\n' \
-         | grep -oE 'https://(claude\.(com|ai)|console\.anthropic\.com)/[^[:space:]]*oauth[^[:space:]]*' \
+  # Keep line boundaries: joining lines appends the next UI hint (e.g.
+  # "Hold Shift ...") to the OAuth state. The wide PTY keeps the URL on one
+  # line. Require an OAuth path on a known login domain, ignoring other links.
+  url="$(grep -oE 'https://(claude\.(com|ai)|console\.anthropic\.com)/[^?[:space:]]*oauth[^[:space:]]*' <<< "${text}" \
          | head -1 || true)"
   [[ -n "${url}" ]] && break
   sleep 1
