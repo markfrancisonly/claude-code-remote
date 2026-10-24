@@ -11,12 +11,12 @@ root-equivalent on the host — run it only on a host you would give Claude
 full control of, and don't expose it to untrusted networks.
 
 ```
-<stack-dir>/               # default /docker/claude, set HOST_STACK_DIR
+<stack-dir>/               # default /docker/claude
 ├── compose.yaml           # the hub container
 ├── claude-login.sh        # guided OAuth login, baked into the image (docker exec)
 ├── recreate.sh            # apply staged compose/.env changes via sibling handoff
 ├── Dockerfile             # image: tools + docker CLI + seed Claude install
-├── entrypoint.sh          # supervisor: reconnect, reattach, auto-update, auth
+├── entrypoint.sh          # supervisor: reconnect, auto-update, auth
 ├── healthcheck.sh         # docker healthcheck (state machine aware)
 ├── .env                   # all configuration switches (copy of .env.example)
 └── data/
@@ -59,12 +59,10 @@ rebuilds and CLI updates.
   (for Home Assistant webhooks, Slack/gotify gateways, and the like). Re-login any time
   with zero downtime: `docker exec -it claude claude` → `/login` → `/exit`
   (shared credentials file — the running session adopts the new tokens).
-  Note that the claude.ai **environment id is tied to the grant**: fresh
-  registrations under an unchanged login reuse the same environment, but the
-  first launch after a re-login registers a NEW one, and the old environment's
-  sessions show "Remote environment unavailable" (their history survives
-  server-side and in local transcripts; `revive-sessions.py --from-env`
-  migrates them — see below).
+  A re-login can recover the connection, but does not guarantee that old
+  remote sessions or their environment can be restored after the outage.
+  Local transcripts remain in the persisted volume; for sessions that do
+  not come back, see [revive-sessions.py](#revive-sessionspy) below.
   Over SSH, prefer `docker exec -it claude claude-login`: the login UI wraps
   and redraws its authorization URL, which makes it painful to copy out of
   PuTTY. `claude-login` drives that same UI in a hidden PTY, prints the URL
@@ -76,24 +74,34 @@ rebuilds and CLI updates.
 
 ## Why it stays connected (design)
 
-A bare `claude remote-control` process dies in practice for four distinct
-reasons (each documented in anthropics/claude-code issues); the supervisor
-handles all of them:
+The supervisor relaunches the normal multi-session server in the same
+workspace directory. Claude maintains its own reconnect record,
+`projects/<cwd-bucket>/bridge-pointer.json`, in the persisted `data/claude`
+volume. The supervisor neither guesses a primary session from transcript
+filenames nor uses `--continue` / `--session-id`: those flags restore only
+one session and cannot be combined with multi-session spawn/capacity flags.
 
-| Failure (evidence) | Mitigation |
+According to the [official Remote Control documentation](https://code.claude.com/docs/en/remote-control#resume-sessions-after-stopping-the-server),
+a normal server restart can restore its previous sessions for about **four
+hours** after stopping. Keep the working directory unchanged, run only one
+server there, and leave session precreation enabled (do not pass
+`--no-create-session-in-dir`). The supervisor forwards termination to Claude
+and waits for orderly shutdown; Compose allows 45 seconds before force-kill.
+Longer outages, expired logins, or unavailable server-side sessions can still
+require a fresh session. Saved transcripts are not a guarantee of restoring
+the old app conversation.
+
+| Failure | Mitigation |
 |---|---|
-| WebSocket drops every 20–60 min; client auto-reconnect sometimes gives up or wedges (#31853, #34255) | In-container supervisor relaunches on exit with capped backoff; optional `CLAUDE_RECYCLE_HOURS` proactively restarts-and-reattaches to bound silent wedges; auto-update keeps the many upstream reconnect fixes current |
-| Fatal OAuth 403 "poll death" every few days kills the process; a plain restart orphans all claude.ai sessions under a new environment ID (#53563) | Supervisor relaunches with `--continue` (CLI ≥ 2.1.200) which **reattaches the same claude.ai session**; auth-flavored failures are detected and only force an interactive re-login after repeated failures |
-| Only resuming the hub's own console session restores the full multi-session server: `--continue` picks the freshest transcript — a WORKER session — and comes back as a useless "Single session · exits when complete" bridge, while the CLI's `.ccr-tip.json` markers (which used to identify the console session) stopped being written ~2.1.2xx; a stale marker resurrects a long-dead session whose lookup fails persistently ("Could not reach the server to look up session…") until the fallback abandons the environment (all observed 2026-08-29) | The supervisor records the primary itself — at every fresh registration, the first NEW transcript in the bucket is the console session's — and resumes exactly that id; with no recorded primary it registers fresh (same environment under an unchanged login) and never uses `--continue`. Lookup failures get `CLAUDE_RESUME_RETRY_MAX` (default 6, waits 15s→60s, ~4 min) attempts before giving up, loudly logged and pushed as a `resume-abandoned` notification |
-| >~10 min of network unreachability makes the process exit **by design** (docs) | Relaunches are gated on an actual network probe, then reattach via `--continue` |
-| OAuth grant hard-expires ~30 days after `/login`; the process then dies instantly — a crash-loop that a state-freshness healthcheck alone reads as *healthy* (≤180s backoff cycles keep the state file inside the 300s staleness window) | Expiry warning N days ahead (log + optional `CLAUDE_NOTIFY_URL` push); "not logged in" stderr is classified fatal → immediate `login-required` (unhealthy); the healthcheck independently flags ≥5 consecutive fast exits as `crash-looping` |
+| Remote-control process exits | Relaunch with capped backoff and the same server settings; native reconnect state handles eligible sessions |
+| Network is unreachable | Wait for a network probe to succeed before relaunching |
+| Login expires or is rejected | Log and optionally send expiry warnings; fatal authentication failures enter `login-required`; repeated fast failures also report unhealthy |
+| Process stays alive but stops responding | Optional `CLAUDE_RECYCLE_HOURS` bounds silent stalls; disabled by default because recycling interrupts sessions |
 
-Plus: `restart: always` restarts the whole container if the supervisor
-itself ever dies; the reattach marker lives in the persisted volume, so
-`docker stop`, `docker restart`, and full recreation/rebuild all come back to
-the SAME claude.ai environment (only a clean `/exit` starts fresh); and a
-healthcheck distinguishes "connected", "reconnecting", "crash-looping" and
-"needs a human to log in" (`docker ps` shows it).
+`restart: always` restarts the container if the supervisor itself dies.
+The healthcheck reports process/state health, including reconnecting,
+crash-looping and login-required; it does not prove that every app
+conversation is reachable.
 
 ## Multi-project architecture
 
@@ -126,10 +134,10 @@ not an architecture change.
 
 ## Session history & retention
 
-Transcripts live in `./data/claude/projects/<cwd-bucket>/`, on the host — a
-dead worker, a killed container or a rebuilt image never touches them. They
-are also load-bearing: reattach resolves the newest session **by reading those
-files**, so losing them turns a resumable session into an orphaned one.
+Transcripts live in `./data/claude/projects/<cwd-bucket>/`, on the host,
+and survive container recreation and image rebuilds. They preserve local
+conversation history separately from the CLI's native remote reconnect
+record. Keeping them longer does not extend the remote reconnect window.
 
 The CLI prunes them after `cleanupPeriodDays`, which upstream defaults to 30.
 First boot therefore seeds `settings.json` with
@@ -145,7 +153,8 @@ Two mechanisms, both persisted so they survive recreation:
 2. The supervisor checks every `CLAUDE_UPDATE_INTERVAL_HOURS` (default 12),
    runs `claude update`, and — because a running process keeps its old
    version — compares the on-disk version to the *launched* version and
-   restarts-with-reattach when they differ.
+   restarts when they differ if `CLAUDE_UPDATE_RESTART=1`. With `0`, the new
+   version takes effect on the next natural restart.
 
 The image itself is just a stable toolbox (docker CLI, git, python, node…);
 rebuild occasionally with:
@@ -158,8 +167,11 @@ docker compose build --pull && docker compose up -d
 
 Recreating this container from a session running *inside* it would kill
 compose mid-recreate, so `./recreate.sh` hands `docker compose up -d` to a
-short-lived sibling container. The session drops and auto-reconnects in
-~30–60 s; history is preserved.
+short-lived sibling container. Active sessions are interrupted while the
+container is replaced. Local history is preserved; eligible remote sessions
+can reconnect through the CLI's native recovery described above. The helper
+reads Claude's stack path from its Compose labels, falling back to its own
+directory, so invoking it from another container targets the Claude stack.
 
 ## Operations cheat-sheet
 
@@ -194,9 +206,18 @@ client messages but never dispatches a new worker, and the client shows
 "bridged Claude Code process stopped responding mid-turn" forever. Clean
 shutdowns revive on their own. Run inside the container — `plan` first, since
 `run` recreates every disconnected active session it lists and
-`cleanup --yes` deletes originals server-side.
+`cleanup --yes` deletes originals server-side. Sessions stranded on an
+environment that no longer exists (they show "Remote environment
+unavailable") need `--from-env <env id>` on `plan` and `run`.
 
 ## Contributing
+
+Offline regression checks (use a fake CLI and Docker; no live sessions):
+
+```bash
+bash tests/test-server-reconnect.sh
+bash tests/test-recreate.sh
+```
 
 See [HUMAN_POLICY.md](HUMAN_POLICY.md).
 

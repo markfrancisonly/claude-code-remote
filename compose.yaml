@@ -64,10 +64,7 @@ services:
       # Reconnect backoff bounds, seconds.
       RECONNECT_BACKOFF_MIN: ${RECONNECT_BACKOFF_MIN:-5}
       RECONNECT_BACKOFF_MAX: ${RECONNECT_BACKOFF_MAX:-180}
-      # 1 = after an abnormal exit, relaunch with --continue so the SAME
-      # claude.ai session is reattached instead of orphaned (CLI v2.1.200+).
-      CLAUDE_RC_CONTINUE: ${CLAUDE_RC_CONTINUE:-1}
-      # Proactively restart-and-reattach every N hours to bound silent
+      # Proactively restart every N hours to bound silent
       # "bridge dead but process alive" states. 0 = disabled.
       CLAUDE_RECYCLE_HOURS: ${CLAUDE_RECYCLE_HOURS:-0}
       # Generic webhook POST target for operator alerts: login-required and
@@ -83,16 +80,9 @@ services:
       # deduped standard log lines; tui = the raw full-screen console (needed
       # for the QR code screen over docker attach, unreadable in log viewers).
       CLAUDE_CONSOLE: ${CLAUDE_CONSOLE:-log}
-      # Fast resume failures tolerated before giving up on reattaching the
-      # claude.ai environment. Giving up orphans every remote session in it.
-      RESUME_RETRY_MAX: ${CLAUDE_RESUME_RETRY_MAX:-6}
       # Warn when the OAuth grant (hard ~30-day lifetime from /login; token
       # rotation does NOT extend it) is within N days of expiry. 0 = off.
       AUTH_EXPIRY_WARN_DAYS: ${CLAUDE_AUTH_EXPIRY_WARN_DAYS:-5}
-
-      # Host-side path of this stack; used by recreate.sh when invoked from
-      # inside the container to hand the recreate off to a sibling container.
-      HOST_STACK_DIR: ${HOST_STACK_DIR:-/docker/claude}
 
     volumes:
       # Claude state: credentials, ~/.claude.json (via symlink), sessions.

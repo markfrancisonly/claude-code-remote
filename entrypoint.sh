@@ -11,12 +11,12 @@
 #        - relaunch on exit with capped exponential backoff
 #        - gate relaunches on network reachability (a >10min network outage
 #          makes the process exit by design — docs "Limitations")
-#        - reattach to the SAME claude.ai session after abnormal exits via
-#          `--continue` (v2.1.200+), so crashes/updates don't orphan sessions
+#        - relaunch in server mode so the CLI can reconnect its persisted
+#          environment and sessions using its native bridge pointer
 #        - classify auth-flavored failures (OAuth 403 poll death, org
 #          eligibility) and force a re-login only when warranted
-#   4. Periodically apply CLI updates and restart-with-reattach so the new
-#      version actually takes effect.
+#   4. Periodically apply CLI updates, restarting to load the new version
+#      when CLAUDE_UPDATE_RESTART=1.
 #   5. Surface state to the Docker healthcheck via /run/claude/state.
 set -Eeuo pipefail
 
@@ -112,11 +112,6 @@ STATE_FILE="${STATE_DIR}/state"
 PID_FILE="${STATE_DIR}/claude.pid"
 RUNNING_VERSION_FILE="${STATE_DIR}/running-version"
 RESTART_REQUEST_MARKER="${STATE_DIR}/restart-request"   # set by updater/recycler
-# The reattach marker lives in the PERSISTED volume, not /run: environments
-# must come back online across container recreation and image rebuilds, not
-# just `docker restart`. Cleared only by a clean /exit.
-RESUME_MARKER="${HOME}/.claude/.resume-next"            # reattach on next launch
-HUB_SID_FILE="${HOME}/.claude/.hub-primary-sid"         # the hub console session's id (see record_hub_primary)
 FORCE_LOGIN_MARKER="${STATE_DIR}/force-login"
 FAIL_STREAK_FILE="${STATE_DIR}/fail-streak"             # consecutive fast crashes (healthcheck reads)
 NOTIFY_LOGIN_STAMP="${STATE_DIR}/notify-login-stamp"    # hourly login-required alert throttle
@@ -134,9 +129,8 @@ fi
 # across a restart.
 rm -f "${RESTART_REQUEST_MARKER}" "${PID_FILE}" "${FAIL_STREAK_FILE}"
 
-# Hub works in /docker (= host /docker); spawned project containers set
-# WORKSPACE_DIR=/project. Keeping per-container directories distinct also
-# scopes --continue resume to this container's own sessions.
+# Keep the working directory stable: the CLI stores native reconnect state
+# under ~/.claude/projects/<cwd-bucket>/bridge-pointer.json.
 WORKSPACE_DIR="${WORKSPACE_DIR:-/docker}"
 
 # Interruptible sleep: plain `sleep` defers the TERM trap until it finishes;
@@ -313,7 +307,6 @@ EOF
   if fresh_login; then
     fail_streak=0
     printf '0' > "${FAIL_STREAK_FILE}" 2>/dev/null || true
-    resume_fail_streak=0
     # Brief settle so the CLI's own post-login writes (org metadata, config)
     # finish before the relaunch reads them.
     log "Login complete; settling ${POST_LOGIN_SETTLE:-20}s before relaunch."
@@ -378,8 +371,8 @@ wait_for_network() {
 
 # ---------------------------------------------------------------------------
 # Restart-request plumbing shared by the updater and recycler loops.
-# The relaunch uses --continue, so the claude.ai session is reattached, not
-# orphaned (CLI v2.1.200+).
+# SIGTERM lets the CLI preserve its environment; the next normal server
+# launch uses its native reconnect state.
 # ---------------------------------------------------------------------------
 request_restart() {
   local reason="$1"
@@ -387,7 +380,7 @@ request_restart() {
   local pid
   pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
   if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-    log "Restarting session (${reason}); will reattach with --continue."
+    log "Restarting server (${reason}); the CLI will use its native reconnect state."
     kill -TERM "${pid}" 2>/dev/null || true
   fi
 }
@@ -423,7 +416,7 @@ updater_loop() {
 }
 
 # ---------------------------------------------------------------------------
-# Optional session recycler: proactively restart-and-reattach every N hours.
+# Optional session recycler: proactively restart the server every N hours.
 # Bounds the damage of 'zombie' states where the process looks alive but the
 # remote bridge is silently dead (github.com/anthropics/claude-code#34255).
 # Off by default (0).
@@ -482,10 +475,9 @@ expiry_warn_loop() {
 }
 
 # The CLI deletes transcripts under ~/.claude/projects/ older than
-# cleanupPeriodDays (default 30). newest_session_id() resumes BY READING those
-# transcripts, so a pruned bucket silently orphans the session a relaunch would
-# have reattached — and the local copy is the only record left of a session
-# whose worker died. Seed a long retention on first boot; an existing value
+# cleanupPeriodDays (default 30). Keep local conversation history available
+# even when a remote session can no longer reconnect. This retention does not
+# extend the CLI's native remote reconnect window. An existing value
 # (operator's own) is never overwritten. 0 = don't touch settings.json.
 seed_settings_defaults() {
   local f="${HOME}/.claude/settings.json"
@@ -574,8 +566,7 @@ on_shutdown() {
   [[ -n "${RECYCLER_PID}" ]] && kill "${RECYCLER_PID}" 2>/dev/null || true
   [[ -n "${EXPIRY_PID}" ]] && kill "${EXPIRY_PID}" 2>/dev/null || true
   if [[ -n "${CLAUDE_PID}" ]] && kill -0 "${CLAUDE_PID}" 2>/dev/null; then
-    # Marker lives in the data volume: reattach after restart OR recreation.
-    touch "${RESUME_MARKER}"
+    # SIGTERM preserves the CLI's native reconnect state and stops workers.
     kill -TERM "${CLAUDE_PID}" 2>/dev/null || true
     for _ in $(seq 1 30); do
       kill -0 "${CLAUDE_PID}" 2>/dev/null || break
@@ -594,116 +585,31 @@ RECYCLER_PID=$!
 expiry_warn_loop &
 EXPIRY_PID=$!
 
-# Flags that cannot combine with --continue (per Remote Control docs); they
-# are stripped from CLAUDE_EXTRA_ARGS on resume attempts.
-RESUME_CONFLICT_FLAGS="--spawn --capacity --create-session-in-dir --no-create-session-in-dir"
-
-# Session transcripts live in ~/.claude/projects/<bucket>, where <bucket> is the
-# cwd with every non-alphanumeric character replaced by '-' (e.g. /docker/myapp
-# -> -docker-myapp). Since siblings would share one ~/.claude volume, scoping by
-# the cwd bucket keeps resume pinned to THIS container's own sessions.
-cwd_bucket() { printf '%s' "${WORKSPACE_DIR}" | sed 's/[^A-Za-z0-9]/-/g'; }
-
-# Newest remote-control session id for this cwd. Used to resume by id:
-# `--continue` only accepts a *recent* session and silently starts fresh once
-# the last one ages out (its "No recent session found in this directory" is why
-# crash/update relaunches were orphaning history). `--session-id` has no recency
-# window, so a bounce reattaches the same conversation regardless of downtime.
-# Only sessions with a sibling <id>.ccr-tip.json marker qualify — that marker is
-# what remote-control leaves next to its own transcripts, and the filter keeps
-# us from resuming headless/cron/local-CLI runs that share the same cwd bucket.
-# The hub's own console session (the "primary") is the ONLY session a
-# relaunch can resume to restore the full multi-session server. Resuming a
-# WORKER session — which is what `--continue` picks, since workers have the
-# freshest transcripts — yields a single-session bridge ("Single session ·
-# exits when complete") that serves nothing else on the environment
-# (observed 2026-08-29). And the CLI no longer marks its own sessions
-# (.ccr-tip.json markers stopped ~2.1.2xx, last seen 2026-08-18; before
-# that, stale markers resurrected long-dead sessions whose lookups fail and
-# trigger environment abandonment). So the supervisor records the primary
-# itself: at every fresh registration, the first NEW transcript to appear in
-# the bucket belongs to the primary. No recorded primary -> register fresh;
-# never --continue.
-hub_primary_sid() {
-  local dir="${HOME}/.claude/projects/$(cwd_bucket)" sid
-  sid="$(cat "${HUB_SID_FILE}" 2>/dev/null || true)"
-  [[ -n "${sid}" && -f "${dir}/${sid}.jsonl" ]] || return 1
-  printf '%s' "${sid}"
-}
-
-record_hub_primary() {  # $1 = file listing the transcripts that predate launch
-  local dir="${HOME}/.claude/projects/$(cwd_bucket)" i f sid
-  for i in $(seq 1 45); do
-    while IFS= read -r f; do
-      grep -qxF "${f}" "$1" 2>/dev/null && continue
-      sid="$(basename "${f}" .jsonl)"
-      printf '%s' "${sid}" > "${HUB_SID_FILE}"
-      log "Recorded hub primary session ${sid}."
-      return 0
-    done < <(ls -1tr "${dir}"/*.jsonl 2>/dev/null)   # oldest-first: the primary is created before any worker
-    zzz 2
-  done
-  warn "no new transcript appeared after fresh registration; hub primary not recorded."
-  rm -f "${HUB_SID_FILE}"
-}
-
+# Always launch the multi-session server. In current Claude Code, --continue
+# and --session-id force single-session mode; neither resumes the whole hub.
+# The CLI itself persists and restores bridge-pointer.json in ~/.claude.
+# Keep the same cwd and default session precreation enabled for native reuse.
 build_launch_args() {
-  local resume="$1"
   LAUNCH_ARGS=(claude remote-control)
   LAUNCH_ARGS+=(--permission-mode "${CLAUDE_PERMISSION_MODE:-acceptEdits}")
   [[ -n "${CLAUDE_SESSION_NAME:-}" ]] && LAUNCH_ARGS+=(--name "${CLAUDE_SESSION_NAME}")
-  if [[ "${resume}" == "1" ]]; then
-    # The caller guarantees a recorded primary exists (see the main loop);
-    # resume exactly it. The spawn flags are stripped below for resumes.
-    local sid
-    sid="$(hub_primary_sid)"
-    LAUNCH_ARGS+=(--session-id "${sid}")
-    log "Resuming hub primary session ${sid} via --session-id."
-  fi
   if [[ -n "${CLAUDE_EXTRA_ARGS:-}" ]]; then
-    local extra=() tok skip_next=0
+    local extra=()
     read -r -a extra <<< "${CLAUDE_EXTRA_ARGS}"
-    for tok in "${extra[@]}"; do
-      if [[ "${skip_next}" == "1" ]]; then
-        skip_next=0
-        continue
-      fi
-      if [[ "${resume}" == "1" ]]; then
-        local flag="${tok%%=*}"
-        if [[ " ${RESUME_CONFLICT_FLAGS} " == *" ${flag} "* ]]; then
-          # Flag with a separate value token (no '=') consumes the next token.
-          if [[ "${tok}" != *"="* && "${flag}" != --no-* && "${flag}" != "--create-session-in-dir" ]]; then
-            skip_next=1
-          fi
-          log "Dropping '${tok}' for --continue relaunch (incompatible)."
-          continue
-        fi
-      fi
-      LAUNCH_ARGS+=("${tok}")
-    done
+    LAUNCH_ARGS+=("${extra[@]}")
   fi
 }
 
 BACKOFF_MIN="${RECONNECT_BACKOFF_MIN:-5}"
 BACKOFF_MAX="${RECONNECT_BACKOFF_MAX:-180}"
-# Fast resume failures tolerated before abandoning the claude.ai environment.
-# Giving up registers a FRESH environment, so the budget errs long: with
-# 15s/30s/45s/60s/60s waits, 6 attempts give a genuinely transient failure
-# (post-reboot network, server blip) ~4 minutes to clear. Note: under an
-# UNCHANGED login a fresh registration reuses the same environment id, so
-# falling back is mostly harmless; after a re-login the environment id
-# changes with the grant and old-env sessions are orphaned regardless
-# (revive-sessions.py --from-env migrates them).
-RESUME_RETRY_MAX="${RESUME_RETRY_MAX:-6}"
 backoff="${BACKOFF_MIN}"
 auth_suspect_streak=0
-resume_fail_streak=0
 fail_streak=0
 
 # Errors that mean the CLI has NO usable login at all (grant past its hard
 # ~30d refreshTokenExpiresAt, revoked token, or non-claude.ai auth). A
 # relaunch can never fix these — only an interactive /login can — so they
-# skip resume retries and force login-required immediately (which also flips
+# force login-required immediately (which also flips
 # the healthcheck unhealthy, making the outage visible in `docker ps`).
 AUTH_FATAL_RE="You must be logged in to use Remote Control|only available with claude\.ai subscriptions|Unable to determine your organization for Remote Control eligibility"
 
@@ -711,40 +617,11 @@ while true; do
   ensure_auth
   wait_for_network
 
-  resume=0
-  if [[ -f "${RESUME_MARKER}" && "${CLAUDE_RC_CONTINUE:-1}" == "1" ]]; then
-    resume=1
-  fi
-  rm -f "${RESUME_MARKER}"
-  if (( resume == 1 )) && ! hub_primary_sid >/dev/null; then
-    warn "Reattach requested but no recorded hub primary session; registering fresh."
-    warn "  (a fresh registration under an unchanged login reuses the same environment)"
-    resume=0
-  fi
-  if (( resume == 1 && resume_fail_streak >= RESUME_RETRY_MAX )); then
-    error "Resume failed ${resume_fail_streak} times in a row; abandoning the old environment."
-    error "  a FRESH environment will register — existing claude.ai sessions will show"
-    error "  'Remote environment unavailable' (revive-sessions.py can recreate them)."
-    notify resume-abandoned "Could not reattach the previous claude.ai environment after ${resume_fail_streak} attempts; registered a fresh one. Old remote sessions are orphaned — revive-sessions.py can recreate them."
-    resume=0
-    resume_fail_streak=0
-  fi
-
-  build_launch_args "${resume}"
+  build_launch_args
   log "Launching: ${LAUNCH_ARGS[*]}"
   err_file="$(mktemp)"
   started_at="$(date +%s)"
   claude_version > "${RUNNING_VERSION_FILE}" || true
-
-  # Crash insurance, written BEFORE launch: a hard host stop / dockerd kill
-  # never runs the TERM trap, so the trap alone can't guarantee reattach.
-  # Removed after a clean /exit below.
-  [[ "${CLAUDE_RC_CONTINUE:-1}" == "1" ]] && touch "${RESUME_MARKER}"
-
-  # Snapshot the transcript bucket so a fresh registration can identify the
-  # NEW file its primary session creates (see record_hub_primary).
-  ls -1 "${HOME}/.claude/projects/$(cwd_bucket)"/*.jsonl > "${STATE_DIR}/pre-launch-jsonl" 2>/dev/null \
-    || : > "${STATE_DIR}/pre-launch-jsonl"
 
   set +e
   # <&0 keeps the container TTY on stdin (bash redirects background jobs'
@@ -761,9 +638,6 @@ while true; do
   CLAUDE_PID=$!
   echo "${CLAUDE_PID}" > "${PID_FILE}"
   set_state running
-  if (( resume == 0 )); then
-    record_hub_primary "${STATE_DIR}/pre-launch-jsonl" &
-  fi
   wait "${CLAUDE_PID}"
   status=$?
   set -e
@@ -780,10 +654,9 @@ while true; do
   # Let the stderr tee (process substitution) flush before classifying.
   zzz 1
 
-  # Supervisor-initiated restart (update/recycle): reattach immediately.
+  # Supervisor-initiated restart (update/recycle): relaunch immediately.
   if [[ -f "${RESTART_REQUEST_MARKER}" ]]; then
     rm -f "${RESTART_REQUEST_MARKER}" "${err_file}"
-    touch "${RESUME_MARKER}"
     log "Supervisor-initiated restart; relaunching immediately."
     backoff="${BACKOFF_MIN}"
     continue
@@ -804,24 +677,6 @@ while true; do
     fail_streak=0
   fi
   printf '%s' "${fail_streak}" > "${FAIL_STREAK_FILE}"
-
-  # A resume attempt that dies instantly is usually the transient
-  # "Could not reach the server to look up session <id>" right after a host
-  # boot — retry the resume a few times before giving up on the session
-  # (the streak cap above falls back to fresh). Fatal auth errors are the
-  # exception: retrying cannot help, classify them right away instead.
-  if [[ "${resume}" == "1" && "${status}" != "0" && "${duration}" -lt 30 ]] \
-     && ! grep -Eq "${AUTH_FATAL_RE}" "${err_file}"; then
-    resume_fail_streak=$(( resume_fail_streak + 1 ))
-    resume_wait=$(( 15 * resume_fail_streak ))
-    (( resume_wait > 60 )) && resume_wait=60
-    warn "Resume attempt failed fast (${resume_fail_streak}/${RESUME_RETRY_MAX}); retrying in ${resume_wait}s."
-    cat "${err_file}" > "${LAST_STDERR_FILE}" 2>/dev/null || true
-    rm -f "${err_file}"
-    zzz "${resume_wait}"
-    continue
-  fi
-  resume_fail_streak=0
 
   # Classify the failure from stderr; keep a copy for post-mortems.
   if [[ "${status}" != "0" ]]; then
@@ -847,13 +702,6 @@ while true; do
     auth_suspect_streak=0
   fi
   rm -f "${err_file}"
-
-  # The marker was pre-set at launch, so any abnormal exit reattaches on
-  # relaunch. A clean exit (user ran /exit) intentionally archives the
-  # session, so drop the marker and start fresh.
-  if [[ "${status}" == "0" ]]; then
-    rm -f "${RESUME_MARKER}"
-  fi
 
   # A run that survived a while means the connection was healthy; reset backoff.
   if (( duration >= 300 )); then
