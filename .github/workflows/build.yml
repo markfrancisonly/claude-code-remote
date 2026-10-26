@@ -39,8 +39,13 @@ jobs:
           for f in *.sh tests/*.sh; do bash -n "$f"; done
           python3 -m py_compile revive-sessions.py
 
+      # recreate.sh insists on a readable compose.yaml at the stack's host
+      # path, so put the checkout where the stack lives.
       - name: Run tests
-        run: for t in tests/*.sh; do bash "$t"; done
+        run: |
+          sudo mkdir -p /docker
+          sudo ln -sfn "$GITHUB_WORKSPACE" /docker/claude
+          for t in tests/*.sh; do bash "$t"; done
 
   docker:
     name: Build and push image
