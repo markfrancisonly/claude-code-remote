@@ -3,3 +3,5 @@ data/
 .env
 # host-specific operational notes kept out of the public repo
 NOTES.local.md
+# host-only settings (e.g. building this checkout locally), merged by compose
+compose.override.yaml
