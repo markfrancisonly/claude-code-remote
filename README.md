@@ -179,6 +179,10 @@ image pass:
 `DOCKER_CLAUDE_IMAGE_TAG` in `.env` (default `latest`). To run your own
 changes instead, build it locally: `docker compose up -d --build`.
 
+Host-only settings (extra mounts, labels, or `pull_policy: never` to always
+build this checkout) belong in a `compose.override.yaml` next to
+`compose.yaml`: it is gitignored, and Docker Compose merges it automatically.
+
 ## Applying config changes from inside a session
 
 Recreating this container from a session running *inside* it would kill
