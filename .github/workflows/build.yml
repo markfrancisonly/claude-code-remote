@@ -1,0 +1,116 @@
+name: Build
+
+# Docker image build:
+# - pushes to `main` publish `latest` and an immutable `sha-*` tag
+# - stable tags publish semver tags and update `latest`
+#   (v1.2.3 -> latest, 1.2.3, 1.2, 1, sha-*); prereleases do not update latest
+# - pull requests run the checks and BUILD the image (nothing is pushed)
+# Images go to GitHub's own registry (GHCR) with the built-in GITHUB_TOKEN.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - "*.sh"
+      - revive-sessions.py
+      - tests/**
+      - compose.yaml
+      - .github/workflows/build.yml
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  quality:
+    name: Check scripts and run tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check scripts
+        run: |
+          for f in *.sh tests/*.sh; do bash -n "$f"; done
+          python3 -m py_compile revive-sessions.py
+
+      - name: Run tests
+        run: for t in tests/*.sh; do bash "$t"; done
+
+  docker:
+    name: Build and push image
+    needs: quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build smoke-test image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: claude-code-remote:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The entrypoint needs a signed-in account, so check the toolbox the
+      # image promises instead of starting the supervisor.
+      - name: Smoke-test image
+        run: |
+          docker run --rm --entrypoint bash claude-code-remote:smoke -ec '
+            claude --version
+            docker --version
+            docker compose version
+            git --version
+            for f in entrypoint.sh healthcheck.sh claude-login; do
+              test -x "/usr/local/bin/$f"
+            done
+          '
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

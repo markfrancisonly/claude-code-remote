@@ -7,7 +7,9 @@ services:
       dockerfile: Dockerfile
       args:
         CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-latest}
-    image: markfrancisonly/claude-code-remote:${DOCKER_CLAUDE_IMAGE_TAG:-local}
+    # Pulled from GHCR (README "The image"); `docker compose up -d --build`
+    # builds it locally instead.
+    image: ghcr.io/markfrancisonly/claude-code-remote:${DOCKER_CLAUDE_IMAGE_TAG:-latest}
     container_name: claude
     restart: always
     init: true

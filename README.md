@@ -27,7 +27,7 @@ full control of, and don't expose it to untrusted networks.
 ## First deployment
 
 ```bash
-docker compose up -d --build
+docker compose up -d                  # pulls the published image
 docker exec -it claude claude-login   # guided OAuth login, copy-friendly URL
 ```
 
@@ -157,11 +157,27 @@ Two mechanisms, both persisted so they survive recreation:
    version takes effect on the next natural restart.
 
 The image itself is just a stable toolbox (docker CLI, git, python, node…);
-rebuild occasionally with:
+update it occasionally with:
 
 ```bash
-docker compose build --pull && docker compose up -d
+docker compose pull && docker compose up -d
 ```
+
+## The image
+
+CI publishes the image to the GitHub Container Registry for linux/amd64 and
+linux/arm64, once the script checks, the tests and a smoke test of the built
+image pass:
+
+| Tag | Points at |
+|---|---|
+| `latest` | the newest build of `main` or of a stable release |
+| `sha-<commit>` | one exact commit; it never moves |
+| `1.2.3`, `1.2`, `1` | the release tag `v1.2.3` |
+
+`compose.yaml` pulls `ghcr.io/markfrancisonly/claude-code-remote`, tagged by
+`DOCKER_CLAUDE_IMAGE_TAG` in `.env` (default `latest`). To run your own
+changes instead, build it locally: `docker compose up -d --build`.
 
 ## Applying config changes from inside a session
 

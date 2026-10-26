@@ -1,0 +1,5 @@
+# never send credentials or runtime state to the build
+data/
+.env
+NOTES.local.md
+.git/
