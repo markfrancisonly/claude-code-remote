@@ -5,6 +5,8 @@ name: Build
 # - stable tags publish semver tags and update `latest`
 #   (v1.2.3 -> latest, 1.2.3, 1.2, 1, sha-*); prereleases do not update latest
 # - pull requests run the checks and BUILD the image (nothing is pushed)
+# Both architectures are built and smoke-tested on native runners before
+# their digests are combined into the published multi-platform tags.
 # Images go to GitHub's own registry (GHCR) with the built-in GITHUB_TOKEN.
 
 on:
@@ -48,9 +50,18 @@ jobs:
           for t in tests/*.sh; do bash "$t"; done
 
   docker:
-    name: Build and push image
+    name: Build and test (${{ matrix.arch }})
     needs: quality
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
@@ -59,35 +70,103 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
 
       - name: Build smoke-test image
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.arch }}
           load: true
           tags: claude-code-remote:smoke
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}
 
       # The entrypoint needs a signed-in account, so check the toolbox the
       # image promises instead of starting the supervisor.
       - name: Smoke-test image
         run: |
-          docker run --rm --entrypoint bash claude-code-remote:smoke -ec '
+          docker run --rm --platform linux/${{ matrix.arch }} \
+            --env EXPECTED_ARCH=${{ matrix.arch }} \
+            --entrypoint bash claude-code-remote:smoke -ec '
+            test "$(dpkg --print-architecture)" = "$EXPECTED_ARCH"
             claude --version
             docker --version
             docker compose version
+            docker buildx version
             git --version
+            node --version
+            npm --version
+            python3 --version
             for f in entrypoint.sh healthcheck.sh claude-login; do
               test -x "/usr/local/bin/$f"
             done
           '
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Reuse the tested build's cached layers and labels. Push by digest so
+      # neither architecture can replace a shared tag with a single-platform image.
+      - name: Push tested image by digest
+        id: push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$IMAGE_DIGEST" > "$RUNNER_TEMP/digests/${{ matrix.arch }}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish multi-platform image
+    needs: docker
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: Docker meta
         id: meta
@@ -102,20 +181,36 @@ jobs:
             type=sha
 
       - name: Login to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Publish manifest
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          sources=()
+          for arch in amd64 arm64; do
+            digest=$(cat "$arch")
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            sources+=("$IMAGE@$digest")
+          done
+          tags=()
+          while IFS= read -r tag; do
+            tags+=(--tag "$tag")
+          done <<< "$IMAGE_TAGS"
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
+
+      - name: Inspect published image
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+        run: |
+          docker buildx imagetools inspect "$IMAGE"
+          docker buildx imagetools inspect "$IMAGE" --raw | jq -e '
+            [.manifests[].platform | select(.os == "linux") | .architecture]
+            | sort == ["amd64", "arm64"]
+          '
