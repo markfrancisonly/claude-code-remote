@@ -165,9 +165,12 @@ docker compose pull && docker compose up -d
 
 ## The image
 
-CI publishes the image to the GitHub Container Registry for linux/amd64 and
-linux/arm64, once the script checks, the tests and a smoke test of the built
-image pass:
+CI publishes the image to the GitHub Container Registry for **linux/amd64**
+(x86-64) and **linux/arm64** (AArch64, including Raspberry Pi with a 64-bit OS
+and Apple Silicon running Linux containers). Each architecture is built and
+smoke-tested on a native runner, including the Claude CLI, Docker CLI and
+plugins, Node.js, Python and Git. Shared tags are published only after the
+script checks, regression tests and both architecture smoke tests pass:
 
 | Tag | Points at |
 |---|---|
@@ -176,8 +179,14 @@ image pass:
 | `1.2.3`, `1.2`, `1` | the release tag `v1.2.3` |
 
 `compose.yaml` pulls `ghcr.io/markfrancisonly/claude-code-remote`, tagged by
-`DOCKER_CLAUDE_IMAGE_TAG` in `.env` (default `latest`). To run your own
-changes instead, build it locally: `docker compose up -d --build`.
+`DOCKER_CLAUDE_IMAGE_TAG` in `.env` (default `latest`). Docker automatically
+selects the matching architecture, so ARM64 hosts use the same Compose file
+and tags without a `platform` override. A 64-bit OS is required; 32-bit ARM
+(`arm/v7`) is not supported.
+
+To run your own changes instead, build natively on either supported
+architecture with `docker compose up -d --build`. The Ubuntu packages and
+Claude installer select binaries for the build's target architecture.
 
 Host-only settings (extra mounts, labels, or `pull_policy: never` to always
 build this checkout) belong in a `compose.override.yaml` next to
