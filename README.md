@@ -184,6 +184,14 @@ selects the matching architecture, so ARM64 hosts use the same Compose file
 and tags without a `platform` override. A 64-bit OS is required; 32-bit ARM
 (`arm/v7`) is not supported.
 
+The GHCR package must be **Public** so these pulls work without a GitHub
+login. After the first publication, the maintainer must select **Public**
+under **Package settings → Change visibility**; a public repository does
+not make its container package public automatically. See
+[GitHub's package visibility instructions](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility#configuring-visibility-of-packages-for-your-personal-account).
+CI checks anonymous access to the published manifest and fails if the image
+cannot be pulled publicly. After changing visibility, rerun the failed job.
+
 To run your own changes instead, build natively on either supported
 architecture with `docker compose up -d --build`. The Ubuntu packages and
 Claude installer select binaries for the build's target architecture.
