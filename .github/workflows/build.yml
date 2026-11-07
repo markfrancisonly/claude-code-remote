@@ -220,3 +220,24 @@ jobs:
             [.manifests[].platform | select(.os == "linux") | .architecture]
             | sort == ["amd64", "arm64"]
           '
+
+      - name: Verify public image access
+        env:
+          IMAGE_PATH: ${{ github.repository }}
+          IMAGE_TAG: ${{ steps.meta.outputs.version }}
+        run: |
+          # Request an anonymous pull token without Docker credentials or GITHUB_TOKEN.
+          if ! token=$(curl --disable --fail --silent --show-error --get \
+            --data-urlencode 'service=ghcr.io' \
+            --data-urlencode "scope=repository:$IMAGE_PATH:pull" \
+            https://ghcr.io/token | jq -er '.token // .access_token'); then
+            echo "::error::Cannot pull ghcr.io/$IMAGE_PATH anonymously. Set the package visibility to Public in GitHub Package settings."
+            exit 1
+          fi
+          curl --disable --fail --silent --show-error \
+            --header "Authorization: Bearer $token" \
+            --header 'Accept: application/vnd.oci.image.index.v1+json' \
+            "https://ghcr.io/v2/$IMAGE_PATH/manifests/$IMAGE_TAG" | jq -e '
+              [.manifests[].platform | select(.os == "linux") | .architecture]
+              | sort == ["amd64", "arm64"]
+            '
